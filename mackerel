@@ -1,28 +1,49 @@
 #!/bin/bash
-# mackerel: free disk space without losing work.
+# mackerel: free disk space on a Mac without losing work.
 #
 #   mackerel                 show what can be freed, ask, clean
 #   mackerel --dry-run       show what can be freed and stop
 #   mackerel --help          options and examples
 #
-# Two tiers. Safe: things that rebuild themselves. Deep (--deep): things that
-# rebuild too, but cost a download or drop something old. Never touched: Docker
-# volumes, worktrees with changes, locked worktrees, or ones used in the last 24 h.
+# Two tiers. Safe: caches their tool refills on its own. Deep (--deep): caches
+# too, but refilling costs a big download, a rebuild, or drops something old.
+# Libraries people build up on purpose (models, backups, VMs, Docker volumes,
+# Xcode archives) are only reported, never deleted.
 #
 # Written for macOS's bash 3.2, so no associative arrays and no mapfile.
 
 set -o pipefail
 
-VERSION="1.0"
-CODE_DIR="${MACKEREL_CODE_DIR:-$HOME/Code}"
+VERSION="1.1"
 SESSION_DAYS="${MACKEREL_SESSION_DAYS:-30}"
+STALE_DAYS="${MACKEREL_STALE_DAYS:-90}"
 WORKTREE_IDLE_MIN=1440 # an agent worktree counts as finished after 24 h idle
 LOG_FILE="$HOME/Library/Logs/mackerel.log"
 LOCK_DIR="${TMPDIR:-/tmp}/mackerel.lock"
+XC="${XDG_CACHE_HOME:-$HOME/.cache}"
+AS="$HOME/Library/Application Support"
+GB=1048576
 
-# cron and launchd start with a bare PATH, where uv and docker are missing.
-PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
+# cron and launchd start with a bare PATH, where most tools are missing.
+PATH="$HOME/.local/bin:$HOME/.cargo/bin:$HOME/go/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
 export LC_CTYPE=UTF-8 # makes ${#s} count characters, not bytes (cron has no LANG)
+
+# Folders that hold your projects: MACKEREL_CODE_DIR (colon separated), or every
+# usual name that exists. Deduplicated by inode, since ~/Code and ~/code are one
+# folder on a case-insensitive disk.
+CODE_DIRS=()
+if [[ -n "${MACKEREL_CODE_DIR:-}" ]]; then
+	IFS=: read -r -a _cands <<<"$MACKEREL_CODE_DIR"
+else
+	_cands=("$HOME"/{Code,code,Projects,projects,Developer,dev,Dev,src,workspace,Workspace,repos,git,GitHub,github})
+fi
+_seen=" "
+for _d in "${_cands[@]}"; do
+	[[ -d "$_d" ]] || continue
+	_ino=$(stat -f %i "$_d")
+	[[ "$_seen" == *" $_ino "* ]] && continue
+	_seen+="$_ino " CODE_DIRS+=("$_d")
+done
 
 # ── Terminal ────────────────────────────────────────────────────────────────
 
@@ -36,6 +57,7 @@ fi
 
 say() { printf '%s\n' "$*"; }
 err() { printf '%s\n' "${RED}mackerel:${R} $*" >&2; }
+have() { command -v "$1" >/dev/null 2>&1; }
 
 # A status line that rewrites itself (terminal only).
 status() { ((TTY)) && printf '\r\e[K  %s%s%s' "$D" "$*" "$R" >&2; }
@@ -68,11 +90,24 @@ du_kb() { # du -sk summed over the paths that exist
 	echo "$t"
 }
 
-# Empties a directory and keeps the directory. Refuses anything outside $HOME.
+du_list() { # same, for paths on stdin, one per line
+	local p t=0
+	while IFS= read -r p; do [[ -n "$p" ]] && t=$((t + $(du_kb "$p"))); done
+	echo "$t"
+}
+
+inside_home() { [[ -n "$1" && "$1" == "$HOME"/?* && -e "$1" ]]; }
+
+# Empties a directory and keeps it. Refuses anything outside $HOME.
 empty_dir() {
-	local d="$1"
-	[[ -n "$d" && "$d" == "$HOME"/?* && -d "$d" ]] || return 1
-	find "$d" -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>>"$LOG_FILE"
+	inside_home "$1" && [[ -d "$1" ]] || return 1
+	find "$1" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
+}
+
+# Removes a directory. Refuses anything outside $HOME.
+remove_dir() {
+	inside_home "$1" || return 1
+	rm -rf "$1"
 }
 
 with_timeout() { perl -e 'alarm shift; exec @ARGV' "$@"; }
@@ -82,46 +117,209 @@ disk() { df -k "$HOME" | awk 'NR == 2 { print $2, $4 }'; } # total and free, in 
 log() { printf '%s\t%s\n' "$(date '+%Y-%m-%dT%H:%M:%S')" "$*" >>"$LOG_FILE"; }
 
 # ── Targets ─────────────────────────────────────────────────────────────────
-# Each target <id> has three functions:
-#   <id>_check  exits 0 if usable, otherwise prints why not
-#   <id>_size   prints the KB it holds now
-#   <id>_clean  cleans it
+#
+#   reg id tier "label" "note" 'paths' ['Name|process regex']
+#
+# paths is shell text, evaluated when the target is measured, so it can ask the
+# tool where its cache lives or honour the tool's own variable. Paths that don't
+# exist are dropped; a target with none left doesn't apply to this Mac. With a
+# process regex, the target waits while that app runs: apps rewrite their cache
+# while open.
+#
+# By default a target is measured with du and cleaned by emptying its paths. A
+# target can replace any step with its own function:
+#   <id>_check  prints why it can't run; returns 1 (shown) or 2 (not on this Mac)
+#   <id>_size   prints KB
+#   <id>_clean  does the work; cur_paths lists the resolved paths
 
-IDS=() TIERS=() LABELS=() NOTES=()
-reg() { IDS+=("$1"); TIERS+=("$2"); LABELS+=("$3"); NOTES+=("$4"); }
+IDS=() TIERS=() LABELS=() NOTES=() PATHS=() APPS=()
+reg() { IDS+=("$1"); TIERS+=("$2"); LABELS+=("$3"); NOTES+=("$4"); PATHS+=("${5:-}"); APPS+=("${6:-}"); }
 
-reg uv safe "uv cache" "drops entries nothing uses"
-reg npm safe "npm cache" "re-downloaded on next install"
-reg swiftpm safe "Swift Package Manager cache" "re-downloaded on next build"
+# An Electron app keeps the same cache folders in every profile it has.
+electron() { # id tier label "App" regex base...
+	local id=$1 tier=$2 label=$3 app=$4 re=$5 b s p=""
+	shift 5
+	for b in "$@"; do
+		for s in Cache "Code Cache" GPUCache CachedData CachedExtensionVSIXs DawnCache DawnGraphiteCache DawnWebGPUCache "Service Worker/CacheStorage"; do
+			p+="\"$b/$s\" "
+		done
+	done
+	reg "$id" "$tier" "$label" "rebuilt when $app opens" "$p" "$app|$re"
+}
+
+# JavaScript and TypeScript
+reg npm safe "npm cache" "re-downloaded on next install" \
+	'"$( (npm config get cache) 2>/dev/null || echo "$HOME/.npm")/_cacache"'
+reg pnpm safe "pnpm store, unused packages" "pnpm store prune" '"$(pnpm store path 2>/dev/null)"'
+reg yarn safe "Yarn cache" "re-downloaded on next install" \
+	'"${YARN_CACHE_FOLDER:-$HOME/Library/Caches/Yarn}" "$HOME/.yarn/berry/cache"'
+reg bun safe "Bun cache" "re-downloaded on next install" '"${BUN_INSTALL_CACHE_DIR:-$HOME/.bun/install/cache}"'
+reg deno safe "Deno cache" "re-downloaded on next run" '"${DENO_DIR:-$HOME/Library/Caches/deno}"'
+reg nodegyp safe "node-gyp headers" "re-downloaded on next native build" '"$HOME/Library/Caches/node-gyp"'
+
+# Python
+reg uv safe "uv cache" "drops entries nothing uses" '"$(uv cache dir 2>/dev/null)"'
+reg pip safe "pip cache" "re-downloaded on next install" '"${PIP_CACHE_DIR:-$HOME/Library/Caches/pip}"'
+reg poetry safe "Poetry cache" "virtualenvs are kept" \
+	'"${POETRY_CACHE_DIR:-$HOME/Library/Caches/pypoetry}/cache" "${POETRY_CACHE_DIR:-$HOME/Library/Caches/pypoetry}/artifacts"'
+reg pipenv safe "Pipenv cache" "re-downloaded on next install" '"$HOME/Library/Caches/pipenv"'
+reg conda safe "Conda package cache" "conda clean --all; envs are kept" \
+	'"$HOME"/{miniconda3,anaconda3,miniforge3,mambaforge,opt/anaconda3,opt/miniconda3}/pkgs'
+
+# Java, Kotlin, Scala
+reg gradle safe "Gradle caches" "re-downloaded on next build" \
+	'"${GRADLE_USER_HOME:-$HOME/.gradle}/caches"' 'A Gradle daemon|GradleDaemon'
+reg coursier safe "Coursier and Ivy caches" "re-downloaded on next build" \
+	'"${COURSIER_CACHE:-$HOME/Library/Caches/Coursier}" "$HOME/.ivy2/cache"'
+
+# C#, F#
+reg nuget safe "NuGet packages" "re-downloaded on next restore" \
+	'"${NUGET_PACKAGES:-$HOME/.nuget/packages}" "$HOME/.local/share/NuGet/http-cache" "$HOME/.local/share/NuGet/v3-cache"'
+
+# Go, Rust, PHP, Ruby
+reg gobuild safe "Go build cache" "rebuilt on next build" \
+	'"$( (go env GOCACHE) 2>/dev/null || echo "$HOME/Library/Caches/go-build")"'
+reg cargo safe "Cargo registry cache" "re-downloaded on next build" \
+	'"${CARGO_HOME:-$HOME/.cargo}/registry/cache" "${CARGO_HOME:-$HOME/.cargo}/registry/src" "${CARGO_HOME:-$HOME/.cargo}/git/checkouts"'
+reg composer safe "Composer cache" "re-downloaded on next install" \
+	'"${COMPOSER_CACHE_DIR:-$HOME/Library/Caches/composer}" "$HOME/.composer/cache" "$XC/composer"'
+reg ruby safe "Bundler and Ruby installer caches" "re-downloaded when needed" \
+	'"$HOME/.bundle/cache" "$HOME/.rvm/archives" "$HOME/.rbenv/cache"'
+
+# Swift, Objective-C, Xcode
+reg swiftpm safe "Swift Package Manager cache" "re-downloaded on next build" '"$HOME/Library/Caches/org.swift.swiftpm"'
+reg cocoapods safe "CocoaPods cache" "re-downloaded on next pod install" '"$HOME/Library/Caches/CocoaPods"'
+reg carthage safe "Carthage cache" "re-downloaded on next build" '"$HOME/Library/Caches/org.carthage.CarthageKit"'
+reg derived safe "Xcode DerivedData" "rebuilt on next build" \
+	'"$HOME/Library/Developer/Xcode/DerivedData"' 'Xcode|/Xcode[^/]*\.app/Contents/MacOS/Xcode'
+reg xcodecache safe "Xcode previews, simulator caches" "rebuilt when needed" \
+	'"$HOME/Library/Developer/Xcode/UserData/Previews" "$HOME/Library/Developer/CoreSimulator/Caches"' \
+	'Xcode|/Xcode[^/]*\.app/Contents/MacOS/Xcode'
 reg sim safe "Invalid iOS simulators" "their runtime is gone"
-reg agents safe "Finished agent worktrees" "clean, idle 24 h; branch kept"
+
+# Dart, Elixir, Haskell, Perl, Lua, Zig, OCaml
+reg pub safe "Dart and Flutter pub cache" "global tools are kept" \
+	'"${PUB_CACHE:-$HOME/.pub-cache}/hosted" "${PUB_CACHE:-$HOME/.pub-cache}/git"'
+reg hex safe "Hex and rebar3 caches" "re-downloaded on next deps.get" \
+	'"${HEX_HOME:-$HOME/.hex}/packages" "$XC/rebar3/hex"'
+reg cabal safe "Cabal package cache" "re-downloaded on next build" \
+	'"${CABAL_DIR:-$HOME/.cabal}/packages" "$XC/cabal/packages"'
+reg cpanm safe "cpanm build folder" "Perl; only build leftovers" '"$HOME/.cpanm/work"'
+reg luarocks safe "LuaRocks cache" "re-downloaded when needed" '"$XC/luarocks"'
+reg zig safe "Zig cache" "rebuilt on next build" '"$XC/zig"'
+reg opam safe "opam download cache" "re-downloaded when needed" '"${OPAMROOT:-$HOME/.opam}/download-cache"'
+
+# C and C++
+reg ccache safe "ccache" "rebuilt on next compile" '"${CCACHE_DIR:-$HOME/Library/Caches/ccache}"'
+reg sccache safe "sccache" "rebuilt on next compile" '"${SCCACHE_DIR:-$HOME/Library/Caches/Mozilla.sccache}"'
+reg vcpkg safe "vcpkg binary cache" "rebuilt on next install" '"${VCPKG_DEFAULT_BINARY_CACHE:-$XC/vcpkg/archives}"'
+
+# Tools
+reg brew safe "Homebrew downloads, old versions" "brew cleanup" '"$(brew --cache 2>/dev/null)"'
 reg docker safe "Dangling Docker images, build cache" "volumes are kept"
-reg next deep "Project .next caches" "rebuilt on next start"
-reg playwright deep "Playwright browsers" "npx playwright install brings them back"
-reg devsup deep "iOS device support" "rebuilt when an iPhone connects"
-reg hf deep "Hugging Face models" "must be downloaded again"
-reg litert deep "litert-night cache" "rebuilt on next use"
-reg sessions deep "Claude sessions older than $SESSION_DAYS days" "can no longer be resumed"
-reg trash deep "Trash" "permanent"
+reg terraform safe "Terraform plugin cache" "re-downloaded on next init" \
+	'"${TF_PLUGIN_CACHE_DIR:-$HOME/.terraform.d/plugin-cache}"'
+reg minikube safe "minikube image cache" "re-downloaded on next start" '"${MINIKUBE_HOME:-$HOME/.minikube}/cache"'
+reg android safe "Android SDK cache" "re-downloaded when needed" '"${ANDROID_USER_HOME:-$HOME/.android}/cache"'
 
-# --force skips the in-use check: MCP servers (Serena) hold uv's lock for days.
-uv_check() { command -v uv >/dev/null || { echo "uv not installed"; return 1; }; }
-uv_size() { du_kb "$(uv cache dir 2>/dev/null)"; }
+# Editors
+reg jetbrains safe "JetBrains IDE caches" "rebuilt when the IDE opens" \
+	'"$HOME/Library/Caches/JetBrains" "$HOME/Library/Caches/Google/AndroidStudio"*' \
+	'A JetBrains IDE|/(IntelliJ IDEA|WebStorm|PyCharm|GoLand|Rider|PhpStorm|CLion|RubyMine|DataGrip|RustRover|Android Studio)[^/]*\.app/'
+electron vscode safe "VS Code caches" "VS Code" '/Visual Studio Code\.app/' "$AS/Code"
+electron cursor safe "Cursor caches" "Cursor" '/Cursor\.app/' "$AS/Cursor"
+electron windsurf safe "Windsurf caches" "Windsurf" '/Windsurf\.app/' "$AS/Windsurf"
+electron postman safe "Postman caches" "Postman" '/Postman\.app/' "$AS/Postman"
+
+# Browsers
+reg chrome safe "Chrome cache" "rebuilt as you browse" '"$HOME/Library/Caches/Google/Chrome"' 'Chrome|/Google Chrome\.app/'
+reg arc safe "Arc cache" "rebuilt as you browse" '"$HOME/Library/Caches/company.thebrowser.Browser"' 'Arc|/Arc\.app/'
+reg brave safe "Brave cache" "rebuilt as you browse" '"$HOME/Library/Caches/BraveSoftware"' 'Brave|/Brave Browser\.app/'
+reg edge safe "Edge cache" "rebuilt as you browse" '"$HOME/Library/Caches/Microsoft Edge"' 'Edge|/Microsoft Edge\.app/'
+reg firefox safe "Firefox cache" "rebuilt as you browse" '"$HOME/Library/Caches/Firefox"' 'Firefox|/Firefox\.app/'
+
+# Design
+reg adobe safe "Adobe media cache" "rebuilt when the app opens" \
+	'"$AS/Adobe/Common/Media Cache Files" "$AS/Adobe/Common/Media Cache"' 'An Adobe app|/Adobe [^/]*\.app/'
+reg figma safe "Figma cache" "rebuilt when Figma opens" '"$HOME/Library/Caches/com.figma.Desktop"' 'Figma|/Figma\.app/'
+reg sketch safe "Sketch cache" "rebuilt when Sketch opens" \
+	'"$HOME/Library/Caches/com.bohemiancoding.sketch3"' 'Sketch|/Sketch\.app/'
+
+# Work and chat
+electron slack safe "Slack caches" "Slack" '/Slack\.app/' \
+	"$AS/Slack" "$HOME/Library/Containers/com.tinyspeck.slackmacgap/Data/Library/Application Support/Slack"
+reg teams safe "Microsoft Teams cache" "rebuilt when Teams opens" \
+	'"$HOME/Library/Containers/com.microsoft.teams2/Data/Library/Caches"' 'Teams|/Microsoft Teams\.app/'
+electron discord safe "Discord caches" "Discord" '/Discord\.app/' "$AS/discord"
+electron notion safe "Notion caches" "Notion" '/Notion\.app/' "$AS/Notion"
+electron linear safe "Linear caches" "Linear" '/Linear\.app/' "$AS/Linear"
+electron claude safe "Claude desktop caches" "Claude" '/Claude\.app/' "$AS/Claude"
+reg spotify safe "Spotify cache" "offline downloads are kept" \
+	'"$HOME/Library/Caches/com.spotify.client"' 'Spotify|/Spotify\.app/'
+
+# Coding agents
+reg agents safe "Finished agent worktrees" "clean, idle 24 h; branch kept"
+
+# Deep: still caches, but refilling them costs something
+reg projcache deep "Build caches in your projects" "rebuilt on next build"
+reg rusttarget deep "Rust target folders" "rebuilt on next cargo build"
+reg staledeps deep "Dependencies of idle projects" "untouched $STALE_DAYS days; reinstall to use"
+reg maven deep "Maven local repository" "re-downloaded; mvn install your own again" '"$HOME/.m2/repository"'
+reg gradledists deep "Gradle distributions" "re-downloaded on next build" \
+	'"${GRADLE_USER_HOME:-$HOME/.gradle}/wrapper/dists"' 'A Gradle daemon|GradleDaemon'
+reg gomod deep "Go module cache" "re-downloaded on next build" \
+	'"$( (go env GOMODCACHE) 2>/dev/null || echo "$HOME/go/pkg/mod")"'
+reg stack deep "Stack GHC installs and snapshots" "re-downloaded on next build" \
+	'"${STACK_ROOT:-$HOME/.stack}/programs" "${STACK_ROOT:-$HOME/.stack}/snapshots"'
+reg julia deep "Julia compiled cache" "recompiled on next load" '"$HOME/.julia/compiled"'
+reg renv deep "renv package cache" "R; reinstalled on next restore" \
+	'"${RENV_PATHS_ROOT:-$HOME/Library/Caches/org.R-project.R/R/renv}"'
+reg conan deep "Conan packages" "rebuilt or re-downloaded" '"${CONAN_HOME:-$HOME/.conan2}/p"'
+reg konan deep "Kotlin/Native toolchains" "re-downloaded on next build" '"${KONAN_DATA_DIR:-$HOME/.konan}"'
+reg playwright deep "Playwright browsers" "npx playwright install brings them back" \
+	'"${PLAYWRIGHT_BROWSERS_PATH:-$HOME/Library/Caches/ms-playwright}"'
+reg puppeteer deep "Puppeteer browsers" "re-downloaded on next install" '"${PUPPETEER_CACHE_DIR:-$XC/puppeteer}"'
+reg cypress deep "Cypress binaries" "re-downloaded on next install" \
+	'"${CYPRESS_CACHE_FOLDER:-$HOME/Library/Caches/Cypress}"'
+reg devsup deep "Xcode device support" "rebuilt when a device connects" \
+	'"$HOME/Library/Developer/Xcode/iOS DeviceSupport" "$HOME/Library/Developer/Xcode/watchOS DeviceSupport" "$HOME/Library/Developer/Xcode/tvOS DeviceSupport" "$HOME/Library/Developer/Xcode/visionOS DeviceSupport"'
+reg hf deep "Hugging Face models and datasets" "re-downloaded; your login is kept" \
+	'"${HF_HUB_CACHE:-${HF_HOME:-$XC/huggingface}/hub}" "${HF_DATASETS_CACHE:-${HF_HOME:-$XC/huggingface}/datasets}"'
+reg torch deep "PyTorch hub models" "re-downloaded on next load" '"${TORCH_HOME:-$XC/torch}"'
+reg whisper deep "Whisper models" "re-downloaded on next run" '"$XC/whisper"'
+reg sessions deep "Agent sessions older than $SESSION_DAYS days" "Claude Code, Codex; can't be resumed"
+reg trash deep "Trash" "permanent" '"$HOME/.Trash"'
+
+# ── Targets with their own steps ────────────────────────────────────────────
+
+cur_paths() { printf '%s\n' "${RESOLVED[$CUR]}"; }
+
+# --force skips the in-use check: MCP servers launched with uvx hold the lock for days.
 uv_clean() { uv cache prune --force; }
+pnpm_clean() { pnpm store prune; }
+brew_clean() { brew cleanup --prune=all; }
 
-npm_check() { command -v npm >/dev/null || { echo "npm not installed"; return 1; }; }
-npm_size() { du_kb "$HOME/.npm/_cacache"; }
-npm_clean() { npm cache clean --force; }
+# conda hardlinks packages into envs, so only conda knows what is really unused.
+conda_clean() {
+	local p rc=0
+	while IFS= read -r p; do
+		if [[ -x "${p%/pkgs}/bin/conda" ]]; then "${p%/pkgs}/bin/conda" clean --all --yes || rc=1; else rc=1; fi
+	done < <(cur_paths)
+	return "$rc"
+}
 
-swiftpm_check() { :; }
-swiftpm_size() { du_kb "$HOME/Library/Caches/org.swift.swiftpm"; }
-swiftpm_clean() { empty_dir "$HOME/Library/Caches/org.swift.swiftpm"; }
+# Go writes its module cache read-only.
+gomod_clean() {
+	local p
+	if have go; then go clean -modcache; return; fi
+	while IFS= read -r p; do chmod -R u+w "$p" && empty_dir "$p"; done < <(cur_paths)
+}
 
 sim_udids() {
 	xcrun simctl list devices unavailable 2>/dev/null |
 		grep -oE '[0-9A-F]{8}-([0-9A-F]{4}-){3}[0-9A-F]{12}'
 }
-sim_check() { xcrun simctl help >/dev/null 2>&1 || { echo "Xcode not installed"; return 1; }; }
+sim_check() { xcrun simctl help >/dev/null 2>&1 || { echo "Xcode not installed"; return 2; }; }
 sim_size() {
 	local u t=0
 	for u in $(sim_udids); do
@@ -131,12 +329,32 @@ sim_size() {
 }
 sim_clean() { xcrun simctl delete unavailable; }
 
-# Worktrees that agents create in <repo>/.claude/worktrees. One goes only if it
-# is unlocked, has no changes, and no file in it changed for 24 h, so an agent
-# that is still working is never touched. The branch stays in the repo.
+# Docker: untagged images and build cache only. Never starts the engine.
+docker_up() { pgrep -xq OrbStack || pgrep -q com.docker.backend || pgrep -q colima; }
+docker_check() {
+	have docker || { echo "not installed"; return 2; }
+	docker_up || { echo "Docker is not running"; return 1; }
+	with_timeout 5 docker info >/dev/null 2>&1 || { echo "Docker is not responding"; return 1; }
+}
+docker_size() {
+	{
+		docker images -f dangling=true --format '{{.Size}}' 2>/dev/null
+		docker system df --format '{{.Type}} {{.Reclaimable}}' 2>/dev/null | grep '^Build Cache'
+	} | docker_kb
+}
+docker_clean() { docker image prune -f && docker builder prune -f; }
+docker_volumes_kb() {
+	docker system df --format '{{.Type}} {{.Reclaimable}}' 2>/dev/null |
+		grep '^Local Volumes' | sed 's/([^)]*)//' | docker_kb
+}
+
+# Worktrees that coding agents create in <repo>/.claude/worktrees. One goes only
+# if it is unlocked, has no changes, and no file in it changed for 24 h, so an
+# agent that is still working is never touched. The branch stays in the repo.
 agents_list() {
 	local wtroot wt gitdir
-	find "$CODE_DIR" -maxdepth 4 \( -name node_modules -o -name .git \) -prune \
+	((${#CODE_DIRS[@]})) || return 0
+	find "${CODE_DIRS[@]}" -maxdepth 4 \( -name node_modules -o -name .git \) -prune \
 		-o -type d -path '*/.claude/worktrees' -print 2>/dev/null |
 		while IFS= read -r wtroot; do
 			for wt in "$wtroot"/*/; do
@@ -151,12 +369,9 @@ agents_list() {
 			done
 		done
 }
-agents_check() { [[ -d "$CODE_DIR" ]] || { echo "$CODE_DIR not found"; return 1; }; }
-agents_size() {
-	local wt t=0
-	while IFS= read -r wt; do t=$((t + $(du_kb "$wt"))); done < <(agents_list)
-	echo "$t"
-}
+code_check() { ((${#CODE_DIRS[@]})) || { echo "no project folder found"; return 2; }; }
+agents_check() { code_check; }
+agents_size() { agents_list | du_list; }
 agents_clean() {
 	local wt repo rc=0
 	while IFS= read -r wt; do
@@ -167,97 +382,144 @@ agents_clean() {
 	return "$rc"
 }
 
-# Docker: untagged images and build cache only. Won't start OrbStack if it is off.
-docker_up() { pgrep -xq OrbStack || pgrep -xq 'Docker Desktop'; }
-docker_check() {
-	command -v docker >/dev/null || { echo "docker not installed"; return 1; }
-	docker_up || { echo "OrbStack is off"; return 1; }
-	with_timeout 5 docker info >/dev/null 2>&1 || { echo "Docker not responding"; return 1; }
-}
-docker_size() {
-	{
-		docker images -f dangling=true --format '{{.Size}}' 2>/dev/null
-		docker system df --format '{{.Type}} {{.Reclaimable}}' 2>/dev/null | grep '^Build Cache'
-	} | docker_kb
-}
-docker_clean() { docker image prune -f && docker builder prune -f; }
-docker_volumes_kb() {
-	docker system df --format '{{.Type}} {{.Reclaimable}}' 2>/dev/null |
-		grep '^Local Volumes' | sed 's/([^)]*)//' | docker_kb
+# Project roots under the code folders, found once per run.
+projects() {
+	local f="$LOCK_DIR/projects"
+	if [[ ! -f "$f" ]]; then
+		find "${CODE_DIRS[@]}" -maxdepth 4 \
+			\( -name node_modules -o -name .git -o -name target -o -name .venv -o -name venv -o -name Pods \
+			-o -name .next -o -name .build -o -name DerivedData -o -name vendor \) -prune \
+			-o -type f \( -name package.json -o -name Cargo.toml -o -name pyproject.toml -o -name requirements.txt \) \
+			-print 2>/dev/null | sed 's#/[^/]*$##' | sort -u >"$f"
+	fi
+	cat "$f"
 }
 
-next_dirs() {
-	find "$CODE_DIR" -maxdepth 4 \( -name node_modules -o -name .git \) -prune \
-		-o -type d -path '*/.next/cache' -print 2>/dev/null
+projcache_list() {
+	local p s
+	projects | while IFS= read -r p; do
+		for s in .next/cache node_modules/.cache .turbo .parcel-cache .angular/cache; do
+			[[ -d "$p/$s" ]] && printf '%s\n' "$p/$s"
+		done
+	done
 }
-next_check() { agents_check; }
-next_size() {
-	local d t=0
-	while IFS= read -r d; do t=$((t + $(du_kb "$d"))); done < <(next_dirs)
-	echo "$t"
+projcache_check() { code_check; }
+projcache_size() { projcache_list | du_list; }
+projcache_clean() { local d; projcache_list | while IFS= read -r d; do empty_dir "$d"; done; }
+
+rusttarget_list() {
+	local p
+	projects | while IFS= read -r p; do
+		[[ -f "$p/Cargo.toml" && -d "$p/target" ]] && printf '%s\n' "$p/target"
+	done
 }
-next_clean() {
-	local d
-	while IFS= read -r d; do empty_dir "$d"; done < <(next_dirs)
+rusttarget_check() {
+	code_check || return
+	pgrep -xq cargo && { echo "cargo is running"; return 1; }
+	return 0
 }
+rusttarget_size() { rusttarget_list | du_list; }
+rusttarget_clean() { local d; rusttarget_list | while IFS= read -r d; do remove_dir "$d"; done; }
 
-playwright_check() { :; }
-playwright_size() { du_kb "$HOME/Library/Caches/ms-playwright"; }
-playwright_clean() { empty_dir "$HOME/Library/Caches/ms-playwright"; }
+# node_modules and virtualenvs of projects where no file changed in STALE_DAYS.
+staledeps_list() {
+	local p d
+	projects | while IFS= read -r p; do
+		[[ -d "$p/node_modules" || -f "$p/.venv/pyvenv.cfg" || -f "$p/venv/pyvenv.cfg" ]] || continue
+		[[ -z "$(find "$p" \( -name node_modules -o -name .venv -o -name venv -o -name .git -o -name target -o -name .next \) \
+			-prune -o -type f -mtime -"$STALE_DAYS" -print -quit 2>/dev/null)" ]] || continue
+		[[ -d "$p/node_modules" ]] && printf '%s\n' "$p/node_modules"
+		for d in .venv venv; do [[ -f "$p/$d/pyvenv.cfg" ]] && printf '%s\n' "$p/$d"; done
+	done
+}
+staledeps_check() { code_check; }
+staledeps_size() { staledeps_list | du_list; }
+staledeps_clean() { local d; staledeps_list | while IFS= read -r d; do remove_dir "$d"; done; }
 
-devsup_check() { :; }
-devsup_size() { du_kb "$HOME/Library/Developer/Xcode/iOS DeviceSupport"; }
-devsup_clean() { empty_dir "$HOME/Library/Developer/Xcode/iOS DeviceSupport"; }
-
-hf_check() { :; }
-hf_size() { du_kb "$HOME/.cache/huggingface"; }
-hf_clean() { empty_dir "$HOME/.cache/huggingface"; }
-
-litert_check() { :; }
-litert_size() { du_kb "$HOME/.cache/litert-night"; }
-litert_clean() { empty_dir "$HOME/.cache/litert-night"; }
-
-# Transcripts (*.jsonl) only. Claude's memory (memory/*.md) stays.
+# Transcripts (*.jsonl) only. Claude Code's memory (memory/*.md) stays.
+SESSION_ROOTS=("$HOME/.claude/projects" "$HOME/.codex/sessions")
 sessions_find() {
-	find "$HOME/.claude/projects" -type f -name '*.jsonl' -mtime +"$SESSION_DAYS" "$@" 2>/dev/null
+	local r
+	for r in "${SESSION_ROOTS[@]}"; do
+		[[ -d "$r" ]] && find "$r" -type f -name '*.jsonl' -mtime +"$SESSION_DAYS" "$@" 2>/dev/null
+	done
 }
-sessions_check() { :; }
+sessions_check() { [[ -d "${SESSION_ROOTS[0]}" || -d "${SESSION_ROOTS[1]}" ]] || { echo "not on this Mac"; return 2; }; }
 sessions_size() { sessions_find -print0 | xargs -0 stat -f %z 2>/dev/null | awk '{ t += $1 } END { printf "%d\n", t / 1024 }'; }
 sessions_clean() { sessions_find -delete; }
 
-trash_check() {
-	ls "$HOME/.Trash" >/dev/null 2>&1 || { echo "needs Full Disk Access"; return 1; }
+trash_check() { ls "$HOME/.Trash" >/dev/null 2>&1 || { echo "needs Full Disk Access"; return 1; }; }
+
+# ── Engine ──────────────────────────────────────────────────────────────────
+
+STATE=() SIZE=() WHY=() RESOLVED=() CUR=0 HIDDEN=0
+
+resolve() { # index to existing paths, one per line
+	local p
+	eval "set -- ${PATHS[$1]}"
+	for p in "$@"; do [[ -n "$p" && -e "$p" ]] && printf '%s\n' "$p"; done
 }
-trash_size() { du_kb "$HOME/.Trash"; }
-trash_clean() { empty_dir "$HOME/.Trash"; }
 
-# ── Measure ─────────────────────────────────────────────────────────────────
-# Fills STATE (ok|skip|empty), SIZE and WHY for the chosen targets.
+t_check() { # index; sets WHY and RESOLVED; returns 0 ok, 1 blocked, 2 absent
+	local i=$1 id=${IDS[$1]} why rc name re
+	if declare -F "${id}_check" >/dev/null; then
+		why=$("${id}_check" 2>/dev/null)
+		rc=$?
+		((rc)) && { WHY[$i]=${why:-unavailable}; return "$rc"; }
+	fi
+	if [[ -n "${PATHS[$i]}" ]]; then
+		RESOLVED[$i]=$(resolve "$i")
+		[[ -n "${RESOLVED[$i]}" ]] || { WHY[$i]="not on this Mac"; return 2; }
+	fi
+	if [[ -n "${APPS[$i]}" ]]; then
+		name=${APPS[$i]%%|*} re=${APPS[$i]#*|}
+		pgrep -f "$re" >/dev/null 2>&1 && { WHY[$i]="$name is running"; return 1; }
+	fi
+	return 0
+}
 
-STATE=() SIZE=() WHY=()
+t_size() {
+	CUR=$1
+	if declare -F "${IDS[$1]}_size" >/dev/null; then "${IDS[$1]}_size"; else cur_paths | du_list; fi
+}
 
-selected() { # $1 index
-	local id="${IDS[$1]}"
+t_clean() {
+	local p rc=0
+	CUR=$1
+	if declare -F "${IDS[$1]}_clean" >/dev/null; then "${IDS[$1]}_clean"; return; fi
+	while IFS= read -r p; do empty_dir "$p" || rc=1; done < <(cur_paths)
+	return "$rc"
+}
+
+selected() { # index
 	if [[ -n "$ONLY" ]]; then
-		[[ ",$ONLY," == *",$id,"* ]]
+		[[ ",$ONLY," == *",${IDS[$1]},"* ]]
 	else
 		[[ "${TIERS[$1]}" == safe || "$DEEP" == 1 || "$DRY" == 1 ]]
 	fi
 }
 
+# Fills STATE: ok (to clean), blocked (shown with a reason), empty and absent
+# (hidden unless --all or --only).
 measure() {
-	local i id why kb
+	local i rc kb
 	for i in "${!IDS[@]}"; do
 		selected "$i" || continue
-		id="${IDS[$i]}"
 		status "measuring ${LABELS[$i]}…"
-		if ! why=$("${id}_check" 2>/dev/null); then
-			STATE[$i]=skip WHY[$i]="${why:-unavailable}" SIZE[$i]=0
-			continue
+		t_check "$i"
+		rc=$?
+		SIZE[$i]=0
+		if ((rc == 2)); then
+			STATE[$i]=absent
+		elif ((rc == 1)); then
+			[[ -n "${RESOLVED[$i]:-}" ]] && SIZE[$i]=$(t_size "$i")
+			if [[ -z "${RESOLVED[$i]:-}" ]] || ((SIZE[i] >= 1024)); then STATE[$i]=blocked; else STATE[$i]=empty; fi
+		else
+			kb=$(t_size "$i" 2>/dev/null)
+			SIZE[$i]=${kb:-0}
+			if ((SIZE[i] < 1024)); then STATE[$i]=empty; else STATE[$i]=ok; fi
 		fi
-		kb=$("${id}_size" 2>/dev/null)
-		SIZE[$i]=${kb:-0}
-		if ((SIZE[i] < 1024)); then STATE[$i]=empty; else STATE[$i]=ok; fi
+		[[ "${STATE[$i]}" == empty || "${STATE[$i]}" == absent ]] && HIDDEN=$((HIDDEN + 1))
 	done
 	status_clear
 }
@@ -273,7 +535,7 @@ header() { # $1 title
 	full=$(printf '%*s' "$fill" '' | sed 's/ /█/g')
 	rest=$(printf '%*s' $((24 - fill)) '' | sed 's/ /░/g')
 	say ""
-	say "  ${D}><${R}${CYN}≋≋≋${R}${D}°>${R}  ${B}mackerel${R}  ${D}$1${R}"
+	say "  ${D}><${R}${CYN}≋≋≋${R}${D}°>${R}  ${B}mackerel${R}${1:+  ${D}$1${R}}"
 	say ""
 	say "  ${c}${full}${R}${D}${rest}${R}   ${B}$(human "$free") free${R} ${D}of $(human "$total"), ${pct}% full${R}"
 }
@@ -286,19 +548,32 @@ pad() { # text width [r = right-align]
 }
 
 row() { # id label size note [color]
-	printf "  ${D}%-11s${R}%s%s%s${R}  ${D}%s${R}\n" "$1" "${5:-}" "$(pad "$2" 38)" "$(pad "$3" 10 r)" "$4"
+	printf "  ${D}%-12s${R}%s%s%s${R}  ${D}%s${R}\n" "$1" "${5:-}" "$(pad "$2" 36)" "$(pad "$3" 10 r)" "$4"
+}
+
+by_size() { # tier state; indexes, biggest first
+	local i
+	for i in "${!IDS[@]}"; do
+		[[ "${TIERS[$i]}" == "$1" && "${STATE[$i]:-}" == "$2" ]] && printf '%s %s\n' "${SIZE[$i]}" "$i"
+	done | sort -rn | awk '{ print $2 }'
 }
 
 section() { # tier title subtitle
-	local i shown=0
-	for i in "${!IDS[@]}"; do
-		[[ "${TIERS[$i]}" == "$1" && -n "${STATE[$i]:-}" ]] || continue
-		if ((!shown)); then say ""; say "  ${B}$2${R}  ${D}$3${R}"; shown=1; fi
-		case "${STATE[$i]}" in
-		ok) row "${IDS[$i]}" "${LABELS[$i]}" "$(human "${SIZE[$i]}")" "${NOTES[$i]}" ;;
-		empty) row "${IDS[$i]}" "${LABELS[$i]}" "-" "nothing to free" "$D" ;;
-		skip) row "${IDS[$i]}" "${LABELS[$i]}" "-" "${WHY[$i]}" "$D" ;;
-		esac
+	local i shown=0 st size note
+	for st in ok blocked empty absent; do
+		[[ "$st" == empty || "$st" == absent ]] && ((!ALL)) && [[ -z "$ONLY" ]] && continue
+		for i in $(by_size "$1" "$st"); do
+			if ((!shown)); then say ""; say "  ${B}$2${R}  ${D}$3${R}"; shown=1; fi
+			case "$st" in
+			ok) row "${IDS[$i]}" "${LABELS[$i]}" "$(human "${SIZE[$i]}")" "${NOTES[$i]}" ;;
+			blocked)
+				size="-"; ((SIZE[i])) && size=$(human "${SIZE[$i]}")
+				row "${IDS[$i]}" "${LABELS[$i]}" "$size" "${WHY[$i]}" "$D" ;;
+			*)
+				note="nothing to free"; [[ "$st" == absent ]] && note="${WHY[$i]}"
+				row "${IDS[$i]}" "${LABELS[$i]}" "-" "$note" "$D" ;;
+			esac
+		done
 	done
 }
 
@@ -310,27 +585,60 @@ total_of() { # tier to freeable KB
 	echo "$t"
 }
 
-hints() { # things to check by hand; mackerel never touches them
-	local lines=() v n
-	if docker_check >/dev/null 2>&1; then
-		v=$(docker_volumes_kb)
-		((v > 1048576)) && lines+=("Unused Docker volumes hold $(human "$v"). They may contain databases, so go through docker volume ls yourself.")
-	fi
-	n=$(tmutil listlocalsnapshots / 2>/dev/null | grep -c 'com.apple.TimeMachine')
-	((n > 0)) && lines+=("$n local Time Machine snapshots keep deleted files on disk until macOS drops them.")
-	((${#lines[@]})) || return 0
-	say ""
-	say "  ${B}Check by hand${R}"
-	for v in "${lines[@]}"; do say "  ${D}·${R} $v"; done
+hidden_note() {
+	((HIDDEN)) && ((!ALL)) && [[ -z "$ONLY" ]] &&
+		say "  ${D}$HIDDEN more targets have nothing to free on this Mac. --all lists them.${R}"
+	return 0
 }
 
-# ── Commands ────────────────────────────────────────────────────────────────
+# Things people keep on purpose. mackerel reports them and never deletes them.
+HINTS=()
+hint_dir() { # min_kb label advice path...
+	local min=$1 label=$2 advice=$3 kb
+	shift 3
+	kb=$(du_kb "$@")
+	((kb >= min)) && HINTS+=("$label: $(human "$kb"). $advice")
+	return 0
+}
+hints() {
+	local v n
+	status "looking for things to check by hand…"
+	HINTS=()
+	if docker_check >/dev/null 2>&1; then
+		v=$(docker_volumes_kb)
+		((v >= GB)) && HINTS+=("Unused Docker volumes: $(human "$v"). They may hold databases; go through docker volume ls.")
+	fi
+	hint_dir $GB "iPhone and iPad backups" "Delete old ones in Finder, under your device." \
+		"$AS/MobileSync/Backup"
+	hint_dir $GB "Xcode archives" "Keep the ones for builds you shipped; Xcode's Organizer deletes the rest." \
+		"$HOME/Library/Developer/Xcode/Archives"
+	hint_dir $GB "Android emulators" "Delete unused ones in Android Studio's Device Manager." \
+		"${ANDROID_USER_HOME:-$HOME/.android}/avd"
+	hint_dir $GB "Ollama models" "ollama list, then ollama rm the ones you don't use." \
+		"${OLLAMA_MODELS:-$HOME/.ollama/models}"
+	hint_dir $GB "LM Studio models" "Remove unused ones under My Models in LM Studio." \
+		"$HOME/.lmstudio/models" "$XC/lm-studio/models"
+	hint_dir $GB "Vagrant boxes" "vagrant box prune removes old versions." \
+		"${VAGRANT_HOME:-$HOME/.vagrant.d}/boxes"
+	hint_dir $GB "Virtual machines" "Delete the ones you no longer run." \
+		"$HOME/Library/Containers/com.utmapp.UTM/Data/Documents" "$HOME/Parallels" "$HOME/Virtual Machines.localized"
+	hint_dir $((5 * GB)) "Downloads" "Sort by size in Finder and see what you still need." "$HOME/Downloads"
+	n=$(tmutil listlocalsnapshots / 2>/dev/null | grep -c 'com.apple.TimeMachine')
+	((n > 0)) && HINTS+=("$n local Time Machine snapshots keep deleted files on disk until macOS drops them.")
+	status_clear
+	((${#HINTS[@]})) || return 0
+	say ""
+	say "  ${B}Check by hand${R}  ${D}mackerel never deletes these${R}"
+	for v in "${HINTS[@]}"; do say "  ${D}·${R} $v"; done
+}
 
-cmd_clean() {
-	local total free i id before after freed sum=0 failed=0 n=0 ans
+# ── Run ─────────────────────────────────────────────────────────────────────
+
+run() {
+	local total free i id before after freed sum=0 failed=0 n=0 ans s p
 	if [[ -n "$BELOW" ]]; then
 		read -r total free < <(disk)
-		if ((free / 1048576 >= BELOW)); then
+		if ((free / GB >= BELOW)); then
 			say "mackerel: $(human "$free") free, above the $BELOW GB threshold. Nothing to do."
 			log "threshold	free=${free}KB	threshold=${BELOW}GB	skipped"
 			return 0
@@ -339,18 +647,18 @@ cmd_clean() {
 
 	if ((DRY)); then header "dry run"; else header ""; fi
 	measure
-	section safe Safe "rebuilds on its own"
-	if ((DEEP)); then section deep Deep "rebuilds, at a cost"; else section deep Deep "only with --deep"; fi
+	section safe Safe "refilled by its tool"
+	if ((DEEP)) || [[ -n "$ONLY" ]]; then section deep Deep "refilled at a cost"; else section deep Deep "only with --deep"; fi
 
 	if ((DRY)); then
-		local s p
 		s=$(total_of safe) p=$(total_of deep)
 		say ""
-		if ((DEEP)); then
+		if ((DEEP)) || [[ -n "$ONLY" ]]; then
 			say "  ${B}Up to $(human $((s + p))) can be freed.${R}"
 		else
 			say "  ${B}Up to $(human "$s") can be freed.${R}${D} --deep adds $(human "$p").${R}"
 		fi
+		hidden_note
 		hints
 		say ""
 		say "  ${D}Dry run: nothing was touched.${R}"
@@ -359,29 +667,30 @@ cmd_clean() {
 	fi
 
 	for i in "${!IDS[@]}"; do [[ "${STATE[$i]:-}" == ok ]] && n=$((n + 1)); done
+	say ""
+	hidden_note
 	if ((n == 0)); then
-		say ""
 		say "  Nothing to free."
+		hints
 		say ""
 		return 0
 	fi
 
-	if [[ "$YES" != 1 ]]; then
-		say ""
+	if ((!YES)); then
 		if ((n == 1)); then printf '  Clean this target?'; else printf '  Clean these %d targets?' "$n"; fi
 		printf ' %s[y/N]%s ' "$D" "$R"
 		read -r ans </dev/tty
 		[[ "$ans" == [yY]* ]] || { say "  Nothing changed."; say ""; return 0; }
+		say ""
 	fi
 
-	say ""
-	log "start	targets=$n	deep=${DEEP:-0}"
+	log "start	targets=$n	deep=$DEEP"
 	for i in "${!IDS[@]}"; do
 		[[ "${STATE[$i]:-}" == ok ]] || continue
 		id="${IDS[$i]}" before="${SIZE[$i]}"
 		status "cleaning ${LABELS[$i]}…"
-		if { printf '── %s\n' "$id"; "${id}_clean"; } >>"$LOG_FILE" 2>&1; then
-			after=$("${id}_size" 2>/dev/null)
+		if { printf '── %s\n' "$id"; t_clean "$i"; } >>"$LOG_FILE" 2>&1; then
+			after=$(t_size "$i" 2>/dev/null)
 			freed=$((before - ${after:-0}))
 			((freed < 0)) && freed=0
 			sum=$((sum + freed))
@@ -409,7 +718,7 @@ cmd_clean() {
 cmd_help() {
 	cat <<EOF
 
-  ${B}mackerel${R} ${D}$VERSION${R}  free disk space without losing work
+  ${B}mackerel${R} ${D}$VERSION${R}  free disk space on a Mac without losing work
 
   ${B}Usage${R}
     mackerel [options]           show what can be freed, ask, clean
@@ -417,27 +726,30 @@ cmd_help() {
   ${B}Options${R}
     -n, --dry-run                show what can be freed and stop
     -d, --deep                   include the deep tier
+    -a, --all                    also list targets with nothing to free
     -y, --yes                    don't ask (for cron and launchd)
         --if-below <GB>          run only when free space is under this
-        --only <id,id>           only these targets (ids are in the table)
+        --only <id,id>           only these targets (--dry-run --all lists the ids)
     -h, --help                   this text
     -v, --version                print the version
 
   ${B}Examples${R}
     mackerel --dry-run --deep
-    mackerel --only uv,npm
+    mackerel --only npm,docker
     mackerel --yes --if-below 60
 
-  ${B}Every evening, before the agents start${R}  ${D}(crontab -e)${R}
+  ${B}Every evening${R}  ${D}(crontab -e)${R}
     0 21 * * *  $HOME/Code/mackerel/mackerel --yes --if-below 60
 
-  ${B}Never touched${R}
-    Docker volumes; worktrees with changes, locked, or used in the last 24 h;
-    Claude's memory; anything outside your home folder
+  ${B}Never deleted${R}
+    Docker volumes, models, backups, VMs and Xcode archives (reported only);
+    worktrees with changes, locked, or used in the last 24 h; app caches while
+    the app is open; Claude Code's memory; anything outside your home folder
 
   ${B}Environment${R}
-    MACKEREL_CODE_DIR            where to look for worktrees and .next ${D}(~/Code)${R}
-    MACKEREL_SESSION_DAYS        age of Claude sessions to delete ${D}(30)${R}
+    MACKEREL_CODE_DIR            project folders, colon separated ${D}(found on their own)${R}
+    MACKEREL_STALE_DAYS          idle days before a project's dependencies go ${D}(90)${R}
+    MACKEREL_SESSION_DAYS        age of agent sessions to delete ${D}(30)${R}
     NO_COLOR                     no colors
 
   ${D}Log: ${LOG_FILE/#$HOME/~}${R}
@@ -448,7 +760,7 @@ EOF
 
 # ── Arguments ───────────────────────────────────────────────────────────────
 
-DRY=0 DEEP=0 YES=0 BELOW="" ONLY=""
+DRY=0 DEEP=0 ALL=0 YES=0 BELOW="" ONLY=""
 
 while (($#)); do
 	case "$1" in
@@ -456,6 +768,7 @@ while (($#)); do
 	-v | --version) say "mackerel $VERSION"; exit 0 ;;
 	-n | --dry-run) DRY=1 ;;
 	-d | --deep) DEEP=1 ;;
+	-a | --all) ALL=1 ;;
 	-y | --yes) YES=1 ;;
 	--if-below)
 		[[ "${2:-}" =~ ^[0-9]+$ ]] || { err "--if-below takes a number of GB"; exit 2; }
@@ -464,7 +777,7 @@ while (($#)); do
 		[[ -n "${2:-}" ]] || { err "--only takes one or more ids, comma separated"; exit 2; }
 		ONLY=$2; shift
 		for id in ${ONLY//,/ }; do
-			[[ " ${IDS[*]} " == *" $id "* ]] || { err "unknown target: $id"; exit 2; }
+			[[ " ${IDS[*]} " == *" $id "* ]] || { err "unknown target: $id (mackerel --dry-run --all lists them)"; exit 2; }
 		done ;;
 	*) err "unknown option: $1 (try: mackerel --help)"; exit 2 ;;
 	esac
@@ -490,4 +803,4 @@ trap 'status_clear; rm -rf "$LOCK_DIR"' EXIT
 trap 'exit 130' INT TERM
 mkdir -p "$(dirname "$LOG_FILE")"
 
-cmd_clean
+run
