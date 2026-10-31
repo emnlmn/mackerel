@@ -1,0 +1,493 @@
+#!/bin/bash
+# mackerel: free disk space without losing work.
+#
+#   mackerel                 show what can be freed, ask, clean
+#   mackerel --dry-run       show what can be freed and stop
+#   mackerel --help          options and examples
+#
+# Two tiers. Safe: things that rebuild themselves. Deep (--deep): things that
+# rebuild too, but cost a download or drop something old. Never touched: Docker
+# volumes, worktrees with changes, locked worktrees, or ones used in the last 24 h.
+#
+# Written for macOS's bash 3.2, so no associative arrays and no mapfile.
+
+set -o pipefail
+
+VERSION="1.0"
+CODE_DIR="${MACKEREL_CODE_DIR:-$HOME/Code}"
+SESSION_DAYS="${MACKEREL_SESSION_DAYS:-30}"
+WORKTREE_IDLE_MIN=1440 # an agent worktree counts as finished after 24 h idle
+LOG_FILE="$HOME/Library/Logs/mackerel.log"
+LOCK_DIR="${TMPDIR:-/tmp}/mackerel.lock"
+
+# cron and launchd start with a bare PATH, where uv and docker are missing.
+PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
+export LC_CTYPE=UTF-8 # makes ${#s} count characters, not bytes (cron has no LANG)
+
+# ── Terminal ────────────────────────────────────────────────────────────────
+
+if [[ -t 1 && -z "${NO_COLOR:-}" && "${TERM:-dumb}" != dumb ]]; then
+	TTY=1
+	B=$'\e[1m' D=$'\e[2m' R=$'\e[0m'
+	CYN=$'\e[36m' RED=$'\e[31m' GRN=$'\e[32m' YEL=$'\e[33m'
+else
+	TTY=0 B='' CYN='' D='' R='' RED='' GRN='' YEL=''
+fi
+
+say() { printf '%s\n' "$*"; }
+err() { printf '%s\n' "${RED}mackerel:${R} $*" >&2; }
+
+# A status line that rewrites itself (terminal only).
+status() { ((TTY)) && printf '\r\e[K  %s%s%s' "$D" "$*" "$R" >&2; }
+status_clear() { ((TTY)) && printf '\r\e[K' >&2; }
+
+# KB to "20.1 GB", "512 MB".
+human() {
+	LC_ALL=C awk -v k="${1:-0}" 'BEGIN {
+		if (k >= 1048576) printf "%.1f GB\n", k / 1048576
+		else if (k >= 1024) printf "%d MB\n", k / 1024
+		else printf "%d KB\n", k }'
+}
+
+# Docker's "4.065GB", "512MB", "0B" to KB.
+docker_kb() {
+	awk '{ for (i = 1; i <= NF; i++) {
+		v = $i; if (v !~ /^[0-9.]+[kKMGT]?B$/) continue
+		n = v + 0; u = v; gsub(/[0-9.]/, "", u)
+		m = (u == "B") ? 1/1000 : (u ~ /^k/) ? 1 : (u == "MB") ? 1000 : (u == "GB") ? 1e6 : 1e9
+		t += n * m * 1000 / 1024 } } END { printf "%d\n", t }'
+}
+
+du_kb() { # du -sk summed over the paths that exist
+	local p t=0 k
+	for p in "$@"; do
+		[[ -e "$p" ]] || continue
+		k=$(du -sk "$p" 2>/dev/null | awk '{print $1}')
+		t=$((t + ${k:-0}))
+	done
+	echo "$t"
+}
+
+# Empties a directory and keeps the directory. Refuses anything outside $HOME.
+empty_dir() {
+	local d="$1"
+	[[ -n "$d" && "$d" == "$HOME"/?* && -d "$d" ]] || return 1
+	find "$d" -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>>"$LOG_FILE"
+}
+
+with_timeout() { perl -e 'alarm shift; exec @ARGV' "$@"; }
+
+disk() { df -k "$HOME" | awk 'NR == 2 { print $2, $4 }'; } # total and free, in KB
+
+log() { printf '%s\t%s\n' "$(date '+%Y-%m-%dT%H:%M:%S')" "$*" >>"$LOG_FILE"; }
+
+# ── Targets ─────────────────────────────────────────────────────────────────
+# Each target <id> has three functions:
+#   <id>_check  exits 0 if usable, otherwise prints why not
+#   <id>_size   prints the KB it holds now
+#   <id>_clean  cleans it
+
+IDS=() TIERS=() LABELS=() NOTES=()
+reg() { IDS+=("$1"); TIERS+=("$2"); LABELS+=("$3"); NOTES+=("$4"); }
+
+reg uv safe "uv cache" "drops entries nothing uses"
+reg npm safe "npm cache" "re-downloaded on next install"
+reg swiftpm safe "Swift Package Manager cache" "re-downloaded on next build"
+reg sim safe "Invalid iOS simulators" "their runtime is gone"
+reg agents safe "Finished agent worktrees" "clean, idle 24 h; branch kept"
+reg docker safe "Dangling Docker images, build cache" "volumes are kept"
+reg next deep "Project .next caches" "rebuilt on next start"
+reg playwright deep "Playwright browsers" "npx playwright install brings them back"
+reg devsup deep "iOS device support" "rebuilt when an iPhone connects"
+reg hf deep "Hugging Face models" "must be downloaded again"
+reg litert deep "litert-night cache" "rebuilt on next use"
+reg sessions deep "Claude sessions older than $SESSION_DAYS days" "can no longer be resumed"
+reg trash deep "Trash" "permanent"
+
+# --force skips the in-use check: MCP servers (Serena) hold uv's lock for days.
+uv_check() { command -v uv >/dev/null || { echo "uv not installed"; return 1; }; }
+uv_size() { du_kb "$(uv cache dir 2>/dev/null)"; }
+uv_clean() { uv cache prune --force; }
+
+npm_check() { command -v npm >/dev/null || { echo "npm not installed"; return 1; }; }
+npm_size() { du_kb "$HOME/.npm/_cacache"; }
+npm_clean() { npm cache clean --force; }
+
+swiftpm_check() { :; }
+swiftpm_size() { du_kb "$HOME/Library/Caches/org.swift.swiftpm"; }
+swiftpm_clean() { empty_dir "$HOME/Library/Caches/org.swift.swiftpm"; }
+
+sim_udids() {
+	xcrun simctl list devices unavailable 2>/dev/null |
+		grep -oE '[0-9A-F]{8}-([0-9A-F]{4}-){3}[0-9A-F]{12}'
+}
+sim_check() { xcrun simctl help >/dev/null 2>&1 || { echo "Xcode not installed"; return 1; }; }
+sim_size() {
+	local u t=0
+	for u in $(sim_udids); do
+		t=$((t + $(du_kb "$HOME/Library/Developer/CoreSimulator/Devices/$u")))
+	done
+	echo "$t"
+}
+sim_clean() { xcrun simctl delete unavailable; }
+
+# Worktrees that agents create in <repo>/.claude/worktrees. One goes only if it
+# is unlocked, has no changes, and no file in it changed for 24 h, so an agent
+# that is still working is never touched. The branch stays in the repo.
+agents_list() {
+	local wtroot wt gitdir
+	find "$CODE_DIR" -maxdepth 4 \( -name node_modules -o -name .git \) -prune \
+		-o -type d -path '*/.claude/worktrees' -print 2>/dev/null |
+		while IFS= read -r wtroot; do
+			for wt in "$wtroot"/*/; do
+				wt="${wt%/}"
+				[[ -d "$wt" ]] || continue
+				gitdir=$(git -C "$wt" rev-parse --absolute-git-dir 2>/dev/null) || continue
+				[[ -e "$gitdir/locked" ]] && continue
+				[[ -z "$(git -C "$wt" status --porcelain 2>/dev/null)" ]] || continue
+				[[ -z "$(find "$wt" \( -name node_modules -o -name .next -o -name .git \) -prune \
+					-o -type f -mmin -"$WORKTREE_IDLE_MIN" -print -quit 2>/dev/null)" ]] || continue
+				printf '%s\n' "$wt"
+			done
+		done
+}
+agents_check() { [[ -d "$CODE_DIR" ]] || { echo "$CODE_DIR not found"; return 1; }; }
+agents_size() {
+	local wt t=0
+	while IFS= read -r wt; do t=$((t + $(du_kb "$wt"))); done < <(agents_list)
+	echo "$t"
+}
+agents_clean() {
+	local wt repo rc=0
+	while IFS= read -r wt; do
+		repo="${wt%/.claude/worktrees/*}"
+		git -C "$repo" worktree remove "$wt" || rc=1
+		git -C "$repo" worktree prune
+	done < <(agents_list)
+	return "$rc"
+}
+
+# Docker: untagged images and build cache only. Won't start OrbStack if it is off.
+docker_up() { pgrep -xq OrbStack || pgrep -xq 'Docker Desktop'; }
+docker_check() {
+	command -v docker >/dev/null || { echo "docker not installed"; return 1; }
+	docker_up || { echo "OrbStack is off"; return 1; }
+	with_timeout 5 docker info >/dev/null 2>&1 || { echo "Docker not responding"; return 1; }
+}
+docker_size() {
+	{
+		docker images -f dangling=true --format '{{.Size}}' 2>/dev/null
+		docker system df --format '{{.Type}} {{.Reclaimable}}' 2>/dev/null | grep '^Build Cache'
+	} | docker_kb
+}
+docker_clean() { docker image prune -f && docker builder prune -f; }
+docker_volumes_kb() {
+	docker system df --format '{{.Type}} {{.Reclaimable}}' 2>/dev/null |
+		grep '^Local Volumes' | sed 's/([^)]*)//' | docker_kb
+}
+
+next_dirs() {
+	find "$CODE_DIR" -maxdepth 4 \( -name node_modules -o -name .git \) -prune \
+		-o -type d -path '*/.next/cache' -print 2>/dev/null
+}
+next_check() { agents_check; }
+next_size() {
+	local d t=0
+	while IFS= read -r d; do t=$((t + $(du_kb "$d"))); done < <(next_dirs)
+	echo "$t"
+}
+next_clean() {
+	local d
+	while IFS= read -r d; do empty_dir "$d"; done < <(next_dirs)
+}
+
+playwright_check() { :; }
+playwright_size() { du_kb "$HOME/Library/Caches/ms-playwright"; }
+playwright_clean() { empty_dir "$HOME/Library/Caches/ms-playwright"; }
+
+devsup_check() { :; }
+devsup_size() { du_kb "$HOME/Library/Developer/Xcode/iOS DeviceSupport"; }
+devsup_clean() { empty_dir "$HOME/Library/Developer/Xcode/iOS DeviceSupport"; }
+
+hf_check() { :; }
+hf_size() { du_kb "$HOME/.cache/huggingface"; }
+hf_clean() { empty_dir "$HOME/.cache/huggingface"; }
+
+litert_check() { :; }
+litert_size() { du_kb "$HOME/.cache/litert-night"; }
+litert_clean() { empty_dir "$HOME/.cache/litert-night"; }
+
+# Transcripts (*.jsonl) only. Claude's memory (memory/*.md) stays.
+sessions_find() {
+	find "$HOME/.claude/projects" -type f -name '*.jsonl' -mtime +"$SESSION_DAYS" "$@" 2>/dev/null
+}
+sessions_check() { :; }
+sessions_size() { sessions_find -print0 | xargs -0 stat -f %z 2>/dev/null | awk '{ t += $1 } END { printf "%d\n", t / 1024 }'; }
+sessions_clean() { sessions_find -delete; }
+
+trash_check() {
+	ls "$HOME/.Trash" >/dev/null 2>&1 || { echo "needs Full Disk Access"; return 1; }
+}
+trash_size() { du_kb "$HOME/.Trash"; }
+trash_clean() { empty_dir "$HOME/.Trash"; }
+
+# ── Measure ─────────────────────────────────────────────────────────────────
+# Fills STATE (ok|skip|empty), SIZE and WHY for the chosen targets.
+
+STATE=() SIZE=() WHY=()
+
+selected() { # $1 index
+	local id="${IDS[$1]}"
+	if [[ -n "$ONLY" ]]; then
+		[[ ",$ONLY," == *",$id,"* ]]
+	else
+		[[ "${TIERS[$1]}" == safe || "$DEEP" == 1 || "$DRY" == 1 ]]
+	fi
+}
+
+measure() {
+	local i id why kb
+	for i in "${!IDS[@]}"; do
+		selected "$i" || continue
+		id="${IDS[$i]}"
+		status "measuring ${LABELS[$i]}…"
+		if ! why=$("${id}_check" 2>/dev/null); then
+			STATE[$i]=skip WHY[$i]="${why:-unavailable}" SIZE[$i]=0
+			continue
+		fi
+		kb=$("${id}_size" 2>/dev/null)
+		SIZE[$i]=${kb:-0}
+		if ((SIZE[i] < 1024)); then STATE[$i]=empty; else STATE[$i]=ok; fi
+	done
+	status_clear
+}
+
+# ── Draw ────────────────────────────────────────────────────────────────────
+
+header() { # $1 title
+	local total free pct fill full rest c
+	read -r total free < <(disk)
+	pct=$((100 - free * 100 / total))
+	fill=$((pct * 24 / 100))
+	if ((pct >= 95)); then c=$RED; elif ((pct >= 85)); then c=$YEL; else c=$GRN; fi
+	full=$(printf '%*s' "$fill" '' | sed 's/ /█/g')
+	rest=$(printf '%*s' $((24 - fill)) '' | sed 's/ /░/g')
+	say ""
+	say "  ${D}><${R}${CYN}≋≋≋${R}${D}°>${R}  ${B}mackerel${R}  ${D}$1${R}"
+	say ""
+	say "  ${c}${full}${R}${D}${rest}${R}   ${B}$(human "$free") free${R} ${D}of $(human "$total"), ${pct}% full${R}"
+}
+
+# printf pads by bytes, which breaks on multibyte text. This pads by characters.
+pad() { # text width [r = right-align]
+	local s="$1" f
+	f=$(printf "%*s" $(($2 - ${#s})) "")
+	if [[ "${3:-}" == r ]]; then printf "%s%s" "$f" "$s"; else printf "%s%s" "$s" "$f"; fi
+}
+
+row() { # id label size note [color]
+	printf "  ${D}%-11s${R}%s%s%s${R}  ${D}%s${R}\n" "$1" "${5:-}" "$(pad "$2" 38)" "$(pad "$3" 10 r)" "$4"
+}
+
+section() { # tier title subtitle
+	local i shown=0
+	for i in "${!IDS[@]}"; do
+		[[ "${TIERS[$i]}" == "$1" && -n "${STATE[$i]:-}" ]] || continue
+		if ((!shown)); then say ""; say "  ${B}$2${R}  ${D}$3${R}"; shown=1; fi
+		case "${STATE[$i]}" in
+		ok) row "${IDS[$i]}" "${LABELS[$i]}" "$(human "${SIZE[$i]}")" "${NOTES[$i]}" ;;
+		empty) row "${IDS[$i]}" "${LABELS[$i]}" "-" "nothing to free" "$D" ;;
+		skip) row "${IDS[$i]}" "${LABELS[$i]}" "-" "${WHY[$i]}" "$D" ;;
+		esac
+	done
+}
+
+total_of() { # tier to freeable KB
+	local i t=0
+	for i in "${!IDS[@]}"; do
+		[[ "${TIERS[$i]}" == "$1" && "${STATE[$i]:-}" == ok ]] && t=$((t + SIZE[i]))
+	done
+	echo "$t"
+}
+
+hints() { # things to check by hand; mackerel never touches them
+	local lines=() v n
+	if docker_check >/dev/null 2>&1; then
+		v=$(docker_volumes_kb)
+		((v > 1048576)) && lines+=("Unused Docker volumes hold $(human "$v"). They may contain databases, so go through docker volume ls yourself.")
+	fi
+	n=$(tmutil listlocalsnapshots / 2>/dev/null | grep -c 'com.apple.TimeMachine')
+	((n > 0)) && lines+=("$n local Time Machine snapshots keep deleted files on disk until macOS drops them.")
+	((${#lines[@]})) || return 0
+	say ""
+	say "  ${B}Check by hand${R}"
+	for v in "${lines[@]}"; do say "  ${D}·${R} $v"; done
+}
+
+# ── Commands ────────────────────────────────────────────────────────────────
+
+cmd_clean() {
+	local total free i id before after freed sum=0 failed=0 n=0 ans
+	if [[ -n "$BELOW" ]]; then
+		read -r total free < <(disk)
+		if ((free / 1048576 >= BELOW)); then
+			say "mackerel: $(human "$free") free, above the $BELOW GB threshold. Nothing to do."
+			log "threshold	free=${free}KB	threshold=${BELOW}GB	skipped"
+			return 0
+		fi
+	fi
+
+	if ((DRY)); then header "dry run"; else header ""; fi
+	measure
+	section safe Safe "rebuilds on its own"
+	if ((DEEP)); then section deep Deep "rebuilds, at a cost"; else section deep Deep "only with --deep"; fi
+
+	if ((DRY)); then
+		local s p
+		s=$(total_of safe) p=$(total_of deep)
+		say ""
+		if ((DEEP)); then
+			say "  ${B}Up to $(human $((s + p))) can be freed.${R}"
+		else
+			say "  ${B}Up to $(human "$s") can be freed.${R}${D} --deep adds $(human "$p").${R}"
+		fi
+		hints
+		say ""
+		say "  ${D}Dry run: nothing was touched.${R}"
+		say ""
+		return 0
+	fi
+
+	for i in "${!IDS[@]}"; do [[ "${STATE[$i]:-}" == ok ]] && n=$((n + 1)); done
+	if ((n == 0)); then
+		say ""
+		say "  Nothing to free."
+		say ""
+		return 0
+	fi
+
+	if [[ "$YES" != 1 ]]; then
+		say ""
+		if ((n == 1)); then printf '  Clean this target?'; else printf '  Clean these %d targets?' "$n"; fi
+		printf ' %s[y/N]%s ' "$D" "$R"
+		read -r ans </dev/tty
+		[[ "$ans" == [yY]* ]] || { say "  Nothing changed."; say ""; return 0; }
+	fi
+
+	say ""
+	log "start	targets=$n	deep=${DEEP:-0}"
+	for i in "${!IDS[@]}"; do
+		[[ "${STATE[$i]:-}" == ok ]] || continue
+		id="${IDS[$i]}" before="${SIZE[$i]}"
+		status "cleaning ${LABELS[$i]}…"
+		if { printf '── %s\n' "$id"; "${id}_clean"; } >>"$LOG_FILE" 2>&1; then
+			after=$("${id}_size" 2>/dev/null)
+			freed=$((before - ${after:-0}))
+			((freed < 0)) && freed=0
+			sum=$((sum + freed))
+			status_clear
+			row "$id" "${LABELS[$i]}" "$(human "$freed")" "freed" "$GRN"
+			log "ok	$id	freed=${freed}KB"
+		else
+			failed=$((failed + 1))
+			status_clear
+			row "$id" "${LABELS[$i]}" "failed" "see the log" "$RED"
+			log "error	$id"
+		fi
+	done
+
+	read -r total free < <(disk)
+	say ""
+	say "  ${B}Freed $(human "$sum").${R}${D} Now $(human "$free") free of $(human "$total").${R}"
+	((failed)) && say "  ${RED}$failed failed.${R} ${D}Log: ${LOG_FILE/#$HOME/~}${R}"
+	hints
+	say ""
+	log "end	freed=${sum}KB	free=${free}KB	errors=$failed"
+	((failed == 0))
+}
+
+cmd_help() {
+	cat <<EOF
+
+  ${B}mackerel${R} ${D}$VERSION${R}  free disk space without losing work
+
+  ${B}Usage${R}
+    mackerel [options]           show what can be freed, ask, clean
+
+  ${B}Options${R}
+    -n, --dry-run                show what can be freed and stop
+    -d, --deep                   include the deep tier
+    -y, --yes                    don't ask (for cron and launchd)
+        --if-below <GB>          run only when free space is under this
+        --only <id,id>           only these targets (ids are in the table)
+    -h, --help                   this text
+    -v, --version                print the version
+
+  ${B}Examples${R}
+    mackerel --dry-run --deep
+    mackerel --only uv,npm
+    mackerel --yes --if-below 60
+
+  ${B}Every evening, before the agents start${R}  ${D}(crontab -e)${R}
+    0 21 * * *  $HOME/Code/mackerel/mackerel --yes --if-below 60
+
+  ${B}Never touched${R}
+    Docker volumes; worktrees with changes, locked, or used in the last 24 h;
+    Claude's memory; anything outside your home folder
+
+  ${B}Environment${R}
+    MACKEREL_CODE_DIR            where to look for worktrees and .next ${D}(~/Code)${R}
+    MACKEREL_SESSION_DAYS        age of Claude sessions to delete ${D}(30)${R}
+    NO_COLOR                     no colors
+
+  ${D}Log: ${LOG_FILE/#$HOME/~}${R}
+  ${D}Exit codes: 0 done, 1 something failed, 2 usage error, 3 already running${R}
+
+EOF
+}
+
+# ── Arguments ───────────────────────────────────────────────────────────────
+
+DRY=0 DEEP=0 YES=0 BELOW="" ONLY=""
+
+while (($#)); do
+	case "$1" in
+	-h | --help) cmd_help; exit 0 ;;
+	-v | --version) say "mackerel $VERSION"; exit 0 ;;
+	-n | --dry-run) DRY=1 ;;
+	-d | --deep) DEEP=1 ;;
+	-y | --yes) YES=1 ;;
+	--if-below)
+		[[ "${2:-}" =~ ^[0-9]+$ ]] || { err "--if-below takes a number of GB"; exit 2; }
+		BELOW=$2; shift ;;
+	--only)
+		[[ -n "${2:-}" ]] || { err "--only takes one or more ids, comma separated"; exit 2; }
+		ONLY=$2; shift
+		for id in ${ONLY//,/ }; do
+			[[ " ${IDS[*]} " == *" $id "* ]] || { err "unknown target: $id"; exit 2; }
+		done ;;
+	*) err "unknown option: $1 (try: mackerel --help)"; exit 2 ;;
+	esac
+	shift
+done
+
+if ((!DRY && !YES)) && [[ ! -t 0 ]]; then
+	err "no terminal to ask on; add --yes"
+	exit 2
+fi
+
+# One run at a time: two cleanups in parallel measure wrong and get in each other's way.
+if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+	pid=$(cat "$LOCK_DIR/pid" 2>/dev/null)
+	if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+		err "already running (pid $pid)"
+		exit 3
+	fi
+	rm -rf "$LOCK_DIR" && mkdir "$LOCK_DIR" || { err "cannot create $LOCK_DIR"; exit 3; }
+fi
+echo $$ >"$LOCK_DIR/pid"
+trap 'status_clear; rm -rf "$LOCK_DIR"' EXIT
+trap 'exit 130' INT TERM
+mkdir -p "$(dirname "$LOG_FILE")"
+
+cmd_clean

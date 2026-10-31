@@ -1,0 +1,55 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 128" role="img" aria-labelledby="t">
+  <title id="t">mackerel</title>
+  <defs>
+    <!-- Blue-green back, silver belly: the hard split of an Atlantic mackerel. -->
+    <linearGradient id="skin" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#123845"/>
+      <stop offset=".42" stop-color="#2f7486"/>
+      <stop offset=".52" stop-color="#9fb8c0"/>
+      <stop offset=".62" stop-color="#dfe6e9"/>
+      <stop offset="1" stop-color="#f4f6f7"/>
+    </linearGradient>
+    <linearGradient id="fin" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#173f4c"/>
+      <stop offset="1" stop-color="#3b7f90"/>
+    </linearGradient>
+    <clipPath id="body">
+      <path id="shape" d="M70 64C104 36 176 25 236 38C258 43 276 53 292 63C278 74 260 84 236 89C176 101 104 92 70 64Z"/>
+    </clipPath>
+  </defs>
+
+  <!-- Forked tail -->
+  <path d="M76 64C62 54 46 36 28 18C36 36 42 52 44 64C42 76 36 92 28 110C46 92 62 74 76 64Z" fill="url(#fin)"/>
+
+  <!-- Dorsal fins and finlets -->
+  <path d="M148 40L166 12L180 38Z" fill="url(#fin)"/>
+  <path d="M110 46L122 30L130 44ZM96 52L106 38L113 50ZM84 58L93 45L99 56Z" fill="#1d4a58"/>
+  <path d="M110 82L122 98L130 84ZM96 76L106 90L113 78ZM84 70L93 83L99 72Z" fill="#7d98a1"/>
+  <path d="M148 88L160 108L172 89Z" fill="#7d98a1"/>
+
+  <!-- Body -->
+  <use href="#shape" fill="url(#skin)"/>
+
+  <!-- Wavy back stripes, clipped to the body outline -->
+  <g clip-path="url(#body)" fill="none" stroke="#0b2129" stroke-width="2.6" stroke-linecap="round" opacity=".85">
+    <path d="M98 30c5 5.5 -5 5.5 0 11.0s-5 5.5 0 11.0"/>
+    <path d="M112 26c4 6.5 -4 6.5 0 13.0s-4 6.5 0 13.0"/>
+    <path d="M127 22c5 7.5 -5 7.5 0 15.0s-5 7.5 0 15.0"/>
+    <path d="M141 20c4 8.0 -4 8.0 0 16.0s-4 8.0 0 16.0"/>
+    <path d="M156 19c5 8.2 -5 8.2 0 16.5s-5 8.2 0 16.5"/>
+    <path d="M170 19c4 8.0 -4 8.0 0 16.0s-4 8.0 0 16.0"/>
+    <path d="M185 20c5 7.5 -5 7.5 0 15.0s-5 7.5 0 15.0"/>
+    <path d="M199 23c4 6.8 -4 6.8 0 13.5s-4 6.8 0 13.5"/>
+    <path d="M213 27c5 5.5 -5 5.5 0 11.0s-5 5.5 0 11.0"/>
+    <path d="M227 32c4 4.0 -4 4.0 0 8.0s-4 4.0 0 8.0"/>
+  </g>
+
+  <!-- Lateral line -->
+  <path d="M84 63C130 58 190 56 246 60" fill="none" stroke="#0b2129" stroke-width="1.4" stroke-linecap="round" opacity=".35"/>
+
+  <!-- Gill cover, pectoral fin, eye -->
+  <path d="M250 44C242 54 242 70 250 82" fill="none" stroke="#0b2129" stroke-width="2" stroke-linecap="round" opacity=".45"/>
+  <path d="M238 68L214 80L232 66Z" fill="#5f8794"/>
+  <circle cx="268" cy="56" r="5.6" fill="#f4f6f7" stroke="#0b2129" stroke-width="1.6"/>
+  <circle cx="269.2" cy="56" r="2.8" fill="#0b2129"/>
+</svg>
