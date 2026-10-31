@@ -20,30 +20,37 @@ or download again.
 ```
   ><≋≋≋°>  mackerel  dry run
 
-  ██████████████████████░░   39.7 GB free of 460.4 GB, 92% full
+  ██████████████████████░░  32.2 GB free / 460.4 GB  94% used
 
-  Safe  refilled by its tool
-  npm         npm cache                               3.4 GB  re-downloaded on next install
-  cargo       Cargo registry cache                    1.6 GB  re-downloaded on next build
-  agents      Finished agent worktrees                1.5 GB  clean, idle 24 h; branch kept
-  spotify     Spotify cache                           679 MB  offline downloads are kept
-  jetbrains   JetBrains IDE caches                    640 MB  rebuilt when the IDE opens
-  slack       Slack caches                            535 MB  rebuilt when Slack opens
-  ...
-  chrome      Chrome cache                            2.1 GB  Chrome is running
-  docker      Dangling Docker images, build cache          -  Docker is not running
+  safe          9.8 GB
+  npm           3.4 GB  npm cache
+  cargo         1.6 GB  Cargo registry cache
+  agents        1.5 GB  Finished agent worktrees
+  spotify       679 MB  Spotify cache
+  jetbrains     640 MB  JetBrains IDE caches
+  slack         535 MB  Slack caches
+  pub           367 MB  Dart and Flutter pub cache
+  uv            282 MB  uv cache
+  vscode        233 MB  VS Code caches
+  pnpm          201 MB  pnpm store, unused packages
+  discord       131 MB  Discord caches
+  cursor        130 MB  Cursor caches
+  brew           98 MB  Homebrew downloads, old versions
+  deno           96 MB  Deno cache
+  ruby           27 MB  Bundler and Ruby installer caches
+  chrome        2.1 GB  Chrome cache                          skip: Chrome is running
+  claude        792 MB  Claude desktop caches                 skip: Claude is running
+  docker             -  Dangling Docker images, build cache   skip: Docker is not running
 
-  Deep  only with --deep
-  rusttarget  Rust target folders                   129.5 GB  rebuilt on next cargo build
-  projcache   Build caches in your projects           368 MB  rebuilt on next build
+  deep        129.9 GB  needs --deep
+  rusttarget  129.5 GB  Rust target folders
+  projcache     368 MB  Build caches in your projects
 
-  Up to 10.1 GB can be freed. --deep adds 129.9 GB.
-  58 more targets have nothing to free on this Mac. --all lists them.
+  by hand               never deleted
+  ollama       43.7 GB  Ollama models; ollama list, ollama rm <model>
 
-  Check by hand  mackerel never deletes these
-  · Ollama models: 43.7 GB. ollama list, then ollama rm the ones you don't use.
-
-  Dry run: nothing was touched.
+  60 empty targets hidden. --all shows them.
+  Dry run, nothing touched.
 ```
 
 ## Install
@@ -58,13 +65,22 @@ ln -s ~/Code/mackerel/mackerel ~/.local/bin/mackerel   # or any directory on you
 ## Usage
 
 ```sh
-mackerel                         # show what can be freed, ask, clean the safe tier
+mackerel                         # pick what to clean, on a full screen
 mackerel --dry-run               # show what can be freed and stop
 mackerel --deep                  # the deep tier too
 mackerel --only npm,docker       # just these targets
 mackerel --yes --if-below 60     # unattended, and only if less than 60 GB is free
 mackerel --help
 ```
+
+In a terminal, a plain `mackerel` opens a picker. Rows appear as they are measured, with the safe
+tier already picked. The disk bar shows how much space you would get back, and it grows and shrinks
+as you pick. Keys: `↑↓` or `j/k` to move, `space` to pick, `a` to pick the whole safe tier, `⏎` to
+clean, `q` to leave without touching anything. The line under the list shows where the row's cache
+lives and what happens once it is gone. While it cleans, the mackerel swims along the bar eating the
+freed space. When the screen closes, the freed rows stay in your scrollback.
+
+With `--dry-run`, `--yes`, a pipe or `NO_COLOR` you get the printed table instead, as above.
 
 | Option | |
 |---|---|
@@ -112,7 +128,7 @@ actually left the disk.
 
 - **Things people keep on purpose.** Docker volumes, Ollama and LM Studio models, iPhone backups,
   Xcode archives, Android emulators, Vagrant boxes, virtual machines and a large Downloads folder show
-  up under "Check by hand" when they pass a gigabyte, with a hint on how to clean them. mackerel
+  up under "by hand" when they pass a gigabyte, with a hint on how to clean them. mackerel
   never touches them.
 - **Agent worktrees that might be in use.** A worktree in `<repo>/.claude/worktrees` goes only when it
   is unlocked, has no uncommitted changes, and no file in it changed in the last 24 hours.

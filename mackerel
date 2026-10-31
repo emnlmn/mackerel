@@ -1,7 +1,7 @@
 #!/bin/bash
 # mackerel: free disk space on a Mac without losing work.
 #
-#   mackerel                 show what can be freed, ask, clean
+#   mackerel                 pick what to clean, full screen
 #   mackerel --dry-run       show what can be freed and stop
 #   mackerel --help          options and examples
 #
@@ -14,7 +14,7 @@
 
 set -o pipefail
 
-VERSION="1.1"
+VERSION="1.2"
 SESSION_DAYS="${MACKEREL_SESSION_DAYS:-30}"
 STALE_DAYS="${MACKEREL_STALE_DAYS:-90}"
 WORKTREE_IDLE_MIN=1440 # an agent worktree counts as finished after 24 h idle
@@ -51,8 +51,9 @@ if [[ -t 1 && -z "${NO_COLOR:-}" && "${TERM:-dumb}" != dumb ]]; then
 	TTY=1
 	B=$'\e[1m' D=$'\e[2m' R=$'\e[0m'
 	CYN=$'\e[36m' RED=$'\e[31m' GRN=$'\e[32m' YEL=$'\e[33m'
+	GRY=$'\e[38;5;238m' EMPTY="█" # one glyph for the whole bar: shades draw shorter
 else
-	TTY=0 B='' CYN='' D='' R='' RED='' GRN='' YEL=''
+	TTY=0 B='' CYN='' D='' R='' RED='' GRN='' YEL='' GRY='' EMPTY="░"
 fi
 
 say() { printf '%s\n' "$*"; }
@@ -64,12 +65,13 @@ status() { ((TTY)) && printf '\r\e[K  %s%s%s' "$D" "$*" "$R" >&2; }
 status_clear() { ((TTY)) && printf '\r\e[K' >&2; }
 
 # KB to "20.1 GB", "512 MB".
-human() {
-	LC_ALL=C awk -v k="${1:-0}" 'BEGIN {
-		if (k >= 1048576) printf "%.1f GB\n", k / 1048576
-		else if (k >= 1024) printf "%d MB\n", k / 1024
-		else printf "%d KB\n", k }'
+hum() { # var KB; sets var, no subshell
+	local k=${2:-0} t
+	if ((k >= 1048576)); then t=$(((k * 10 + 524288) / 1048576)); printf -v "$1" '%d.%d GB' $((t / 10)) $((t % 10))
+	elif ((k >= 1024)); then printf -v "$1" '%d MB' $((k / 1024))
+	else printf -v "$1" '%d KB' "$k"; fi
 }
+human() { local v; hum v "$1"; printf '%s\n' "$v"; }
 
 # Docker's "4.065GB", "512MB", "0B" to KB.
 docker_kb() {
@@ -102,6 +104,13 @@ inside_home() { [[ -n "$1" && "$1" == "$HOME"/?* && -e "$1" ]]; }
 empty_dir() {
 	inside_home "$1" && [[ -d "$1" ]] || return 1
 	find "$1" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
+}
+
+# Removes each path on stdin that still exists (a parent may have gone first).
+remove_each() {
+	local d rc=0
+	while IFS= read -r d; do [[ -e "$d" ]] || continue; remove_dir "$d" || rc=1; done
+	return "$rc"
 }
 
 # Removes a directory. Refuses anything outside $HOME.
@@ -419,7 +428,7 @@ rusttarget_check() {
 	return 0
 }
 rusttarget_size() { rusttarget_list | du_list; }
-rusttarget_clean() { local d; rusttarget_list | while IFS= read -r d; do remove_dir "$d"; done; }
+rusttarget_clean() { rusttarget_list | remove_each; }
 
 # node_modules and virtualenvs of projects where no file changed in STALE_DAYS.
 staledeps_list() {
@@ -434,7 +443,7 @@ staledeps_list() {
 }
 staledeps_check() { code_check; }
 staledeps_size() { staledeps_list | du_list; }
-staledeps_clean() { local d; staledeps_list | while IFS= read -r d; do remove_dir "$d"; done; }
+staledeps_clean() { staledeps_list | remove_each; }
 
 # Transcripts (*.jsonl) only. Claude Code's memory (memory/*.md) stays.
 SESSION_ROOTS=("$HOME/.claude/projects" "$HOME/.codex/sessions")
@@ -495,31 +504,37 @@ selected() { # index
 	if [[ -n "$ONLY" ]]; then
 		[[ ",$ONLY," == *",${IDS[$1]},"* ]]
 	else
-		[[ "${TIERS[$1]}" == safe || "$DEEP" == 1 || "$DRY" == 1 ]]
+		[[ "${TIERS[$1]}" == safe || "$DEEP" == 1 || "$DRY" == 1 || "$INTER" == 1 ]]
 	fi
+}
+
+measure_one() { # index
+	local i=$1 rc kb
+	t_check "$i"
+	rc=$?
+	SIZE[$i]=0
+	if ((rc == 2)); then
+		STATE[$i]=absent
+	elif ((rc == 1)); then
+		[[ -n "${RESOLVED[$i]:-}" ]] && SIZE[$i]=$(t_size "$i")
+		if [[ -z "${RESOLVED[$i]:-}" ]] || ((SIZE[i] >= 1024)); then STATE[$i]=blocked; else STATE[$i]=empty; fi
+	else
+		kb=$(t_size "$i" 2>/dev/null)
+		SIZE[$i]=${kb:-0}
+		if ((SIZE[i] < 1024)); then STATE[$i]=empty; else STATE[$i]=ok; fi
+	fi
+	[[ "${STATE[$i]}" == empty || "${STATE[$i]}" == absent ]] && HIDDEN=$((HIDDEN + 1))
+	return 0
 }
 
 # Fills STATE: ok (to clean), blocked (shown with a reason), empty and absent
 # (hidden unless --all or --only).
 measure() {
-	local i rc kb
+	local i
 	for i in "${!IDS[@]}"; do
 		selected "$i" || continue
 		status "measuring ${LABELS[$i]}…"
-		t_check "$i"
-		rc=$?
-		SIZE[$i]=0
-		if ((rc == 2)); then
-			STATE[$i]=absent
-		elif ((rc == 1)); then
-			[[ -n "${RESOLVED[$i]:-}" ]] && SIZE[$i]=$(t_size "$i")
-			if [[ -z "${RESOLVED[$i]:-}" ]] || ((SIZE[i] >= 1024)); then STATE[$i]=blocked; else STATE[$i]=empty; fi
-		else
-			kb=$(t_size "$i" 2>/dev/null)
-			SIZE[$i]=${kb:-0}
-			if ((SIZE[i] < 1024)); then STATE[$i]=empty; else STATE[$i]=ok; fi
-		fi
-		[[ "${STATE[$i]}" == empty || "${STATE[$i]}" == absent ]] && HIDDEN=$((HIDDEN + 1))
+		measure_one "$i"
 	done
 	status_clear
 }
@@ -533,11 +548,11 @@ header() { # $1 title
 	fill=$((pct * 24 / 100))
 	if ((pct >= 95)); then c=$RED; elif ((pct >= 85)); then c=$YEL; else c=$GRN; fi
 	full=$(printf '%*s' "$fill" '' | sed 's/ /█/g')
-	rest=$(printf '%*s' $((24 - fill)) '' | sed 's/ /░/g')
+	rest=$(printf '%*s' $((24 - fill)) '' | sed "s/ /$EMPTY/g")
 	say ""
 	say "  ${D}><${R}${CYN}≋≋≋${R}${D}°>${R}  ${B}mackerel${R}${1:+  ${D}$1${R}}"
 	say ""
-	say "  ${c}${full}${R}${D}${rest}${R}   ${B}$(human "$free") free${R} ${D}of $(human "$total"), ${pct}% full${R}"
+	say "  ${c}${full}${R}${GRY:-$D}${rest}${R}  ${B}$(human "$free") free${R}${D} / $(human "$total")  ${pct}% used${R}"
 }
 
 # printf pads by bytes, which breaks on multibyte text. This pads by characters.
@@ -547,8 +562,14 @@ pad() { # text width [r = right-align]
 	if [[ "${3:-}" == r ]]; then printf "%s%s" "$f" "$s"; else printf "%s%s" "$s" "$f"; fi
 }
 
-row() { # id label size note [color]
-	printf "  ${D}%-12s${R}%s%s%s${R}  ${D}%s${R}\n" "$1" "${5:-}" "$(pad "$2" 36)" "$(pad "$3" 10 r)" "$4"
+row() { # id size label [aside] [color for the size]
+	local aside=""
+	[[ -n "${4:-}" ]] && aside="$(pad "" $((36 - ${#3})))  ${D}$4${R}"
+	printf "  ${D}%-11s${R}%s%s${R}  %s%s\n" "$1" "${5:-}" "$(pad "$2" 9 r)" "$3" "$aside"
+}
+
+head_row() { # title [total] [aside]
+	printf "  ${B}%-11s%s${R}%s\n" "$1" "$(pad "${2:-}" 9 r)" "${3:+  ${D}$3${R}}"
 }
 
 by_size() { # tier state; indexes, biggest first
@@ -558,20 +579,19 @@ by_size() { # tier state; indexes, biggest first
 	done | sort -rn | awk '{ print $2 }'
 }
 
-section() { # tier title subtitle
-	local i shown=0 st size note
+section() { # tier title [aside]
+	local i shown=0 st size t
+	t=$(total_of "$1")
 	for st in ok blocked empty absent; do
 		[[ "$st" == empty || "$st" == absent ]] && ((!ALL)) && [[ -z "$ONLY" ]] && continue
 		for i in $(by_size "$1" "$st"); do
-			if ((!shown)); then say ""; say "  ${B}$2${R}  ${D}$3${R}"; shown=1; fi
+			if ((!shown)); then say ""; head_row "$2" "$( ((t)) && human "$t")" "${3:-}"; shown=1; fi
 			case "$st" in
-			ok) row "${IDS[$i]}" "${LABELS[$i]}" "$(human "${SIZE[$i]}")" "${NOTES[$i]}" ;;
+			ok) row "${IDS[$i]}" "$(human "${SIZE[$i]}")" "${LABELS[$i]}" ;;
 			blocked)
 				size="-"; ((SIZE[i])) && size=$(human "${SIZE[$i]}")
-				row "${IDS[$i]}" "${LABELS[$i]}" "$size" "${WHY[$i]}" "$D" ;;
-			*)
-				note="nothing to free"; [[ "$st" == absent ]] && note="${WHY[$i]}"
-				row "${IDS[$i]}" "${LABELS[$i]}" "-" "$note" "$D" ;;
+				row "${IDS[$i]}" "$size" "${LABELS[$i]}" "skip: ${WHY[$i]}" "$D" ;;
+			*) row "${IDS[$i]}" "-" "${LABELS[$i]}" "${WHY[$i]:-empty}" "$D" ;;
 			esac
 		done
 	done
@@ -587,49 +607,377 @@ total_of() { # tier to freeable KB
 
 hidden_note() {
 	((HIDDEN)) && ((!ALL)) && [[ -z "$ONLY" ]] &&
-		say "  ${D}$HIDDEN more targets have nothing to free on this Mac. --all lists them.${R}"
+		say "  ${D}$HIDDEN empty targets hidden. --all shows them.${R}"
 	return 0
 }
 
 # Things people keep on purpose. mackerel reports them and never deletes them.
 HINTS=()
-hint_dir() { # min_kb label advice path...
-	local min=$1 label=$2 advice=$3 kb
+hint_dir() { # min_kb key advice path...
+	local min=$1 key=$2 advice=$3 kb
 	shift 3
 	kb=$(du_kb "$@")
-	((kb >= min)) && HINTS+=("$label: $(human "$kb"). $advice")
+	((kb >= min)) && HINTS+=("$key	$(human "$kb")	$advice")
 	return 0
 }
 hints() {
-	local v n
+	local v k sz adv
 	status "looking for things to check by hand…"
-	HINTS=()
-	if docker_check >/dev/null 2>&1; then
-		v=$(docker_volumes_kb)
-		((v >= GB)) && HINTS+=("Unused Docker volumes: $(human "$v"). They may hold databases; go through docker volume ls.")
-	fi
-	hint_dir $GB "iPhone and iPad backups" "Delete old ones in Finder, under your device." \
-		"$AS/MobileSync/Backup"
-	hint_dir $GB "Xcode archives" "Keep the ones for builds you shipped; Xcode's Organizer deletes the rest." \
-		"$HOME/Library/Developer/Xcode/Archives"
-	hint_dir $GB "Android emulators" "Delete unused ones in Android Studio's Device Manager." \
-		"${ANDROID_USER_HOME:-$HOME/.android}/avd"
-	hint_dir $GB "Ollama models" "ollama list, then ollama rm the ones you don't use." \
-		"${OLLAMA_MODELS:-$HOME/.ollama/models}"
-	hint_dir $GB "LM Studio models" "Remove unused ones under My Models in LM Studio." \
-		"$HOME/.lmstudio/models" "$XC/lm-studio/models"
-	hint_dir $GB "Vagrant boxes" "vagrant box prune removes old versions." \
-		"${VAGRANT_HOME:-$HOME/.vagrant.d}/boxes"
-	hint_dir $GB "Virtual machines" "Delete the ones you no longer run." \
-		"$HOME/Library/Containers/com.utmapp.UTM/Data/Documents" "$HOME/Parallels" "$HOME/Virtual Machines.localized"
-	hint_dir $((5 * GB)) "Downloads" "Sort by size in Finder and see what you still need." "$HOME/Downloads"
-	n=$(tmutil listlocalsnapshots / 2>/dev/null | grep -c 'com.apple.TimeMachine')
-	((n > 0)) && HINTS+=("$n local Time Machine snapshots keep deleted files on disk until macOS drops them.")
+	hints_collect
 	status_clear
 	((${#HINTS[@]})) || return 0
 	say ""
-	say "  ${B}Check by hand${R}  ${D}mackerel never deletes these${R}"
-	for v in "${HINTS[@]}"; do say "  ${D}·${R} $v"; done
+	head_row "by hand" "" "never deleted"
+	for v in "${HINTS[@]}"; do
+		IFS=$'\t' read -r k sz adv <<<"$v"
+		row "$k" "$sz" "$adv"
+	done
+}
+hints_collect() {
+	local v n
+	HINTS=()
+	if docker_check >/dev/null 2>&1; then
+		v=$(docker_volumes_kb)
+		((v >= GB)) && HINTS+=("dockervol	$(human "$v")	unused Docker volumes; docker volume ls")
+	fi
+	hint_dir $GB "backups" "iPhone backups; Finder › device › Manage Backups" \
+		"$AS/MobileSync/Backup"
+	hint_dir $GB "archives" "Xcode archives; Xcode › Organizer" \
+		"$HOME/Library/Developer/Xcode/Archives"
+	hint_dir $GB "avd" "Android emulators; Android Studio › Device Manager" \
+		"${ANDROID_USER_HOME:-$HOME/.android}/avd"
+	hint_dir $GB "ollama" "Ollama models; ollama list, ollama rm <model>" \
+		"${OLLAMA_MODELS:-$HOME/.ollama/models}"
+	hint_dir $GB "lmstudio" "LM Studio models; LM Studio › My Models" \
+		"$HOME/.lmstudio/models" "$XC/lm-studio/models"
+	hint_dir $GB "vagrant" "Vagrant boxes; vagrant box prune" \
+		"${VAGRANT_HOME:-$HOME/.vagrant.d}/boxes"
+	hint_dir $GB "vms" "virtual machines (UTM, Parallels, VMware)" \
+		"$HOME/Library/Containers/com.utmapp.UTM/Data/Documents" "$HOME/Parallels" "$HOME/Virtual Machines.localized"
+	hint_dir $((5 * GB)) "downloads" "~/Downloads; sort by size in Finder" "$HOME/Downloads"
+	n=$(tmutil listlocalsnapshots / 2>/dev/null | grep -c 'com.apple.TimeMachine')
+	((n > 0)) && HINTS+=("snapshots	-	$n Time Machine snapshots; tmutil listlocalsnapshots /")
+	return 0
+}
+
+# ── Interactive ─────────────────────────────────────────────────────────────
+#
+# A plain `mackerel` in a terminal opens a full-screen picker: rows land as they
+# are measured, the disk bar previews the space you would get back, and while it
+# cleans the mackerel swims along the bar eating it. Pipes, cron, --yes and
+# --dry-run keep the printed output above.
+#
+# Drawing a frame starts no process: every value is plain Bash, sizes are worked
+# out once per change (tui_sums), and the frame goes out in one printf.
+
+SEL=() HS=() PH=() FREED=() ITEMS=() NAV=() HINTS=()
+POS=0 TOP=0 EATING=0 MODE="" NOW="" MSG="" SPIN=0 FREE0=0 TOTAL0=0 DONE=0 BGPID="" STTY=""
+ROWS=24 COLS=80 RESIZED=1 KEY="" ALL_KB=0 GAIN=0 T_SAFE=0 T_DEEP=0 P_SAFE=0
+FISH="><≋≋≋°>" FISH2="><≈≈≈°>" SPINNER="⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+
+tui_on() {
+	STTY=$(stty -g)
+	stty -echo -icanon
+	trap 'RESIZED=1' WINCH
+	printf '\e[?1049h\e[?25l'
+}
+tui_off() {
+	[[ -n "$BGPID" ]] && kill "$BGPID" 2>/dev/null
+	[[ -n "$STTY" ]] || return 0
+	stty "$STTY"; STTY=""
+	printf '\e[?25h\e[?1049l'
+}
+
+# Totals the frame needs, in KB: everything cleanable, what is picked and not yet
+# cleaned (GAIN), and per tier.
+tui_sums() {
+	local i
+	ALL_KB=0 GAIN=0 T_SAFE=0 T_DEEP=0 P_SAFE=0
+	for i in "${!IDS[@]}"; do
+		[[ "${STATE[$i]:-}" == ok ]] || continue
+		ALL_KB=$((ALL_KB + SIZE[i]))
+		if [[ "${TIERS[$i]}" == safe ]]; then T_SAFE=$((T_SAFE + SIZE[i])); else T_DEEP=$((T_DEEP + SIZE[i])); fi
+		[[ "${SEL[$i]:-0}" == 1 && "${PH[$i]:-}" != ok && "${PH[$i]:-}" != fail ]] || continue
+		GAIN=$((GAIN + SIZE[i]))
+		[[ "${TIERS[$i]}" == safe ]] && P_SAFE=$((P_SAFE + SIZE[i]))
+	done
+}
+
+# Display order: tier header, cleanable rows biggest first, then skipped ones.
+tui_items() {
+	local tier st i first v
+	ITEMS=() NAV=()
+	for tier in safe deep; do
+		first=1
+		for st in ok blocked; do
+			for i in $(by_size "$tier" "$st"); do
+				((first)) && { ITEMS+=("h:$tier"); first=0; }
+				[[ "$st" == ok ]] && NAV+=(${#ITEMS[@]})
+				ITEMS+=("r:$i")
+			done
+		done
+		((first)) || ITEMS+=("")
+	done
+	if ((${#HINTS[@]})); then
+		ITEMS+=("h:hand")
+		for v in "${HINTS[@]}"; do ITEMS+=("x:$v"); done
+	fi
+	tui_sums
+}
+
+tui_bar() { # width; sets LINE
+	local w=$1 free gain scale cf cg c ch col last="" fs=-9 fish=$FISH pct fc
+	free=$((FREE0 + DONE)) gain=$((GAIN - EATING))
+	scale=$((FREE0 + ALL_KB)); ((scale > 0)) || scale=1
+	cf=$((free * w / scale)) cg=$((gain * w / scale))
+	((gain > 0 && cg == 0)) && cg=1
+	((cf > w)) && cf=$w
+	((cf + cg > w)) && cg=$((w - cf))
+	pct=$((100 - free * 100 / TOTAL0))
+	if ((pct >= 95)); then fc=$RED; elif ((pct >= 85)); then fc=$YEL; else fc=$GRN; fi
+	if [[ "$MODE" == clean || "$MODE" == done ]]; then
+		fs=$((cf - 7)); ((fs < 0)) && fs=0
+		((SPIN % 2)) && fish=$FISH2
+	fi
+	LINE=""
+	for ((c = 0; c < w; c++)); do
+		if ((c >= fs && c < fs + 7)); then ch=${fish:c-fs:1} col=${B}${CYN}
+		elif ((c < cf)); then ch="█" col=$fc
+		elif ((c < cf + cg)); then ch="█" col=$CYN
+		else ch="█" col=$GRY; fi
+		[[ "$col" != "$last" ]] && { LINE+="${R}${col}"; last=$col; }
+		LINE+=$ch
+	done
+	LINE+=$R
+}
+
+tui_row() { # item, is-cursor, width; sets LINE
+	local it=$1 cur=$2 w=$3 i k sz adv mark lab aside="" pre=" " tone="" sp
+	LINE=""
+	case "$it" in
+	"") ;;
+	h:safe) sz=""; ((T_SAFE)) && hum sz "$T_SAFE"; printf -v LINE '      %s%-11s%9s%s' "$B" safe "$sz" "$R" ;;
+	h:deep) sz=""; ((T_DEEP)) && hum sz "$T_DEEP"; printf -v LINE '      %s%-11s%9s%s  %scosts a rebuild or a download%s' "$B" deep "$sz" "$R" "$D" "$R" ;;
+	h:hand) printf -v LINE '      %s%-11s%s%9s  %snever deleted%s' "$B" "by hand" "$R" "" "$D" "$R" ;;
+	x:*)
+		IFS=$'\t' read -r k sz adv <<<"${it#x:}"
+		((${#adv} > w - 26)) && adv="${adv:0:$((w - 27))}…"
+		printf -v LINE '      %s%-11s%9s  %s%s' "$D" "$k" "$sz" "$adv" "$R" ;;
+	r:*)
+		i=${it#r:}
+		sz=${HS[$i]}
+		case "${PH[$i]:-}" in
+		run) mark="${CYN}${SPINNER:SPIN%10:1}${R}" ;;
+		ok) mark="${GRN}✓${R}" tone=$GRN; hum sz "${FREED[$i]}" ;;
+		fail) mark="${RED}✗${R}" sz=failed tone=$RED aside="see the log" ;;
+		*)
+			if [[ "${STATE[$i]}" == blocked ]]; then mark="${D}·${R}" tone=$D aside=${WHY[$i]}
+			elif [[ "${SEL[$i]:-0}" == 1 ]]; then
+				if [[ "${TIERS[$i]}" == deep ]]; then mark="${YEL}●${R}"; else mark="${CYN}●${R}"; fi
+			else mark="${D}○${R}"; [[ "$MODE" == select ]] || tone=$D; fi ;;
+		esac
+		((cur)) && pre="${B}${CYN}›${R}"
+		lab=${LABELS[$i]}
+		((${#lab} > w - 30)) && lab="${lab:0:$((w - 31))}…"
+		if [[ -n "$aside" ]] && ((36 + ${#aside} + 30 < w)); then
+			printf -v sp '%*s' $((38 - ${#lab})) ""
+			aside="${sp}${D}${aside}${R}"
+		else aside=""; fi
+		if ((cur)); then lab="${B}${lab}${R}"; elif [[ "$tone" == "$D" ]]; then lab="${D}${lab}${R}"; fi
+		printf -v LINE '  %s %s %s%-11s%s%9s%s  %s%s' "$pre" "$mark" "$D" "${IDS[$i]}" "${R}${tone}" "$sz" "$R" "$lab" "$aside" ;;
+	esac
+}
+
+# Rows: 6 for the header, h for the list, 3 for the footer. Never more than the
+# terminal has, or it scrolls and the frame jumps.
+tui_draw() {
+	local w h n=0 out cur=-1 focus p i note s a b c
+	if ((RESIZED)); then
+		RESIZED=0
+		set -- $(stty size </dev/tty 2>/dev/null)
+		ROWS=${1:-24} COLS=${2:-80}
+	fi
+	w=$((COLS < 100 ? COLS : 100))
+	h=$((ROWS - 9)); ((h < 3)) && h=3
+	[[ "$MODE" == select ]] && cur=${NAV[$POS]:--1}
+	focus=$cur
+	if [[ "$MODE" == clean ]]; then # keep the running row on screen
+		for ((p = 0; p < ${#ITEMS[@]}; p++)); do
+			[[ "${ITEMS[$p]}" == r:* && "${PH[${ITEMS[$p]#r:}]:-}" == run ]] && { focus=$p; break; }
+		done
+	fi
+	# Scroll only when the focus leaves the window; show the tier header above
+	# the first row.
+	if ((focus >= 0)); then
+		((focus - 1 < TOP)) && TOP=$((focus - 1))
+		((focus >= TOP + h - 1)) && TOP=$((focus - h + 2))
+	fi
+	((TOP > ${#ITEMS[@]} - h)) && TOP=$((${#ITEMS[@]} - h))
+	((TOP < 0)) && TOP=0
+
+	out=$'\e[H\e[K\n'"  ${D}><${R}${CYN}≋≋≋${R}${D}°>${R}  ${B}mackerel${R}"$'\e[K\n\e[K\n'
+	tui_bar $((w - 4)); out+="  ${LINE}"$'\e[K\n'
+	hum a $((FREE0 + DONE)); hum c "$TOTAL0"
+	case "$MODE" in
+	clean | done) hum s "$DONE"; out+="  ${B}${GRN}Freed ${s}${R}  ${D}${a} free of ${c}${R}" ;;
+	*)
+		if ((GAIN)); then hum b $((FREE0 + GAIN)); out+="  ${B}${a} free${R}  ${D}›${R}  ${B}${CYN}${b}${R}  ${D}of ${c}${R}"
+		else out+="  ${B}${a} free${R}  ${D}of ${c}, $((100 - (FREE0 + DONE) * 100 / TOTAL0))% used${R}"; fi ;;
+	esac
+	out+=$'\e[K\n\e[K\n'
+	for ((p = TOP; p < ${#ITEMS[@]} && n < h; p++, n++)); do
+		if ((n == h - 1 && p < ${#ITEMS[@]} - 1)); then
+			out+="    ${D}↓ $((${#ITEMS[@]} - p)) more${R}"$'\e[K\n'; n=$((n + 1)); break
+		fi
+		tui_row "${ITEMS[$p]}" $((p == cur)) "$w"
+		out+="${LINE}"$'\e[K\n'
+	done
+	for (( ; n < h; n++)); do out+=$'\e[K\n'; done
+	note=""
+	if ((cur >= 0)); then
+		i=${ITEMS[$cur]#r:}
+		p=${RESOLVED[$i]:-}; p=${p%%$'\n'*}; p=${p/#$HOME/\~}
+		note="${p:+$p · }${NOTES[$i]}"
+		((${#note} > w - 6)) && note="${note:0:$((w - 7))}…"
+	fi
+	out+=$'\e[K\n'"    ${D}${note}${R}"$'\e[K\n'
+	case "$MODE" in
+	measure) out+="  ${CYN}${SPINNER:SPIN%10:1}${R} ${D}measuring ${NOW}…${R}" ;;
+	select)
+		if [[ -n "$MSG" ]]; then out+="    ${YEL}${MSG}${R}"
+		else hum s "$GAIN"; out+="    ${D}↑↓ move  space pick  a all  q quit  ⏎ clean${R} ${B}${CYN}${s}${R}"; fi ;;
+	clean) out+="  ${CYN}${SPINNER:SPIN%10:1}${R} ${D}cleaning ${NOW}…${R}" ;;
+	done) out+="    ${D}any key to close${R}" ;;
+	esac
+	printf '%s\e[K\e[J' "$out"
+}
+
+tui_key() { # sets KEY: up, down, pick, all, go, quit, or empty after a second
+	local k r
+	KEY=""
+	IFS= read -rsn1 -t 1 k </dev/tty || return 0
+	case "$k" in
+	$'\e') IFS= read -rsn2 -t 1 r </dev/tty; case "$r" in '[A' | OA) KEY=up ;; '[B' | OB) KEY=down ;; esac ;;
+	k | K) KEY=up ;; j | J) KEY=down ;;
+	' ' | x) KEY=pick ;; a | A) KEY=all ;; '' | $'\n') KEY=go ;; q | Q) KEY=quit ;;
+	esac
+}
+
+tui_clean() {
+	local p i id before after freed step from n=0 failed=0 f0 e tick
+	MODE=clean DONE=0
+	for p in "${NAV[@]}"; do i=${ITEMS[$p]#r:}; [[ "${SEL[$i]:-0}" == 1 ]] && n=$((n + 1)); done
+	log "start	targets=$n	deep=$DEEP	interactive"
+	for p in "${NAV[@]}"; do
+		i=${ITEMS[$p]#r:}
+		[[ "${SEL[$i]:-0}" == 1 ]] || continue
+		id=${IDS[$i]} before=${SIZE[$i]} NOW=${LABELS[$i]} PH[$i]=run
+		rm -f "$LOCK_DIR/after"
+		( { printf '── %s\n' "$id"; t_clean "$i"; } >>"$LOG_FILE" 2>&1 || exit 1
+			t_size "$i" >"$LOCK_DIR/after" 2>/dev/null ) &
+		BGPID=$! from=$DONE tick=0
+		set -- $(disk); f0=$2
+		# While it works, the fish follows the free space df sees, capped at the target's size.
+		while kill -0 "$BGPID" 2>/dev/null; do
+			SPIN=$((SPIN + 1))
+			if ((tick++ % 5 == 0)); then
+				set -- $(disk)
+				e=$(($2 - f0)); ((e < 0)) && e=0; ((e > before)) && e=$before
+				EATING=$e DONE=$((from + e))
+			fi
+			tui_draw; sleep 0.08
+		done
+		if wait "$BGPID"; then
+			after=$(cat "$LOCK_DIR/after" 2>/dev/null)
+			freed=$((before - ${after:-0})); ((freed < 0)) && freed=0
+			FREED[$i]=$freed e=$EATING
+			for step in 1 2 3 4 5 6 7 8 9 10; do # then swims to the measured edge
+				EATING=$((e + (freed - e) * step / 10)) DONE=$((from + EATING)) SPIN=$((SPIN + 1))
+				tui_draw; sleep 0.03
+			done
+			PH[$i]=ok EATING=0
+			log "ok	$id	freed=${freed}KB"
+		else
+			PH[$i]=fail failed=$((failed + 1)) EATING=0
+			log "error	$id"
+		fi
+		BGPID=""
+		tui_sums
+	done
+	set -- $(disk); TOTAL0=$1 FREE0=$(($2 - DONE)) # the bar keeps drawing FREE0 + DONE
+	log "end	freed=${DONE}KB	free=$((FREE0 + DONE))KB	errors=$failed"
+	return "$failed"
+}
+
+tui_run() {
+	local i p v s failed=0
+	set -- $(disk); TOTAL0=$1 FREE0=$2
+	tui_on
+	MODE=measure
+	for i in "${!IDS[@]}"; do
+		selected "$i" || continue
+		NOW=${LABELS[$i]} SPIN=$((SPIN + 1))
+		tui_draw
+		measure_one "$i"
+		[[ "${STATE[$i]}" == ok || "${STATE[$i]}" == blocked ]] || continue
+		s="-"; ((SIZE[i])) && hum s "${SIZE[$i]}"
+		HS[$i]=$s
+		[[ "${STATE[$i]}" == ok && "${TIERS[$i]}" == safe ]] && SEL[$i]=1
+		[[ -n "$ONLY" && "${STATE[$i]}" == ok ]] && SEL[$i]=1
+		tui_items
+	done
+	NOW="things to check by hand" SPIN=$((SPIN + 1)); tui_draw
+	hints_collect
+	tui_items
+	MODE=select POS=0 TOP=0
+	if ((!${#NAV[@]})); then
+		MSG="Nothing to free. Any key to close."
+		tui_draw
+		IFS= read -rsn1 v </dev/tty
+		tui_off; say "  Nothing to free."; return 0
+	fi
+
+	tui_draw
+	while :; do
+		tui_key
+		[[ -z "$KEY" ]] && { ((RESIZED)) && tui_draw; continue; }
+		MSG=""
+		p=${NAV[$POS]} i=${ITEMS[$p]#r:}
+		case "$KEY" in
+		up) ((POS > 0)) && POS=$((POS - 1)) ;;
+		down) ((POS < ${#NAV[@]} - 1)) && POS=$((POS + 1)) ;;
+		pick) SEL[$i]=$((1 - ${SEL[$i]:-0})); tui_sums ;;
+		all)
+			if ((P_SAFE == T_SAFE)); then v=0; else v=1; fi
+			for p in "${NAV[@]}"; do i=${ITEMS[$p]#r:}; [[ "${TIERS[$i]}" == safe ]] && SEL[$i]=$v; done
+			tui_sums ;;
+		go) ((GAIN)) && break; MSG="Pick something first: space." ;;
+		quit) tui_off; say "  Nothing changed."; return 0 ;;
+		esac
+		tui_draw
+	done
+
+	tui_clean || failed=$?
+	MODE=done NOW=""
+	tui_draw
+	perl -MPOSIX -e 'tcflush(0, TCIFLUSH)' </dev/tty # keys pressed while it cleaned
+	IFS= read -rsn1 v </dev/tty
+	tui_off
+
+	# What stays in the scrollback once the screen closes.
+	say ""
+	for p in "${NAV[@]}"; do
+		i=${ITEMS[$p]#r:}
+		case "${PH[$i]:-}" in
+		ok) hum s "${FREED[$i]}"; row "${IDS[$i]}" "$s" "${LABELS[$i]}" "" "$GRN" ;;
+		fail) row "${IDS[$i]}" failed "${LABELS[$i]}" "see the log" "$RED" ;;
+		esac
+	done
+	say ""
+	say "  ${B}Freed $(human "$DONE").${R}${D} $(human $((FREE0 + DONE))) free / $(human "$TOTAL0").${R}"
+	((failed)) && say "  ${RED}$failed failed.${R} ${D}Log: ${LOG_FILE/#$HOME/~}${R}"
+	say ""
+	((failed == 0))
 }
 
 # ── Run ─────────────────────────────────────────────────────────────────────
@@ -645,23 +993,17 @@ run() {
 		fi
 	fi
 
+	((INTER)) && { tui_run; return; }
 	if ((DRY)); then header "dry run"; else header ""; fi
 	measure
-	section safe Safe "refilled by its tool"
-	if ((DEEP)) || [[ -n "$ONLY" ]]; then section deep Deep "refilled at a cost"; else section deep Deep "only with --deep"; fi
+	section safe safe
+	if ((DEEP)) || [[ -n "$ONLY" ]]; then section deep deep; else section deep deep "needs --deep"; fi
 
 	if ((DRY)); then
-		s=$(total_of safe) p=$(total_of deep)
-		say ""
-		if ((DEEP)) || [[ -n "$ONLY" ]]; then
-			say "  ${B}Up to $(human $((s + p))) can be freed.${R}"
-		else
-			say "  ${B}Up to $(human "$s") can be freed.${R}${D} --deep adds $(human "$p").${R}"
-		fi
-		hidden_note
 		hints
 		say ""
-		say "  ${D}Dry run: nothing was touched.${R}"
+		hidden_note
+		say "  ${D}Dry run, nothing touched.${R}"
 		say ""
 		return 0
 	fi
@@ -677,7 +1019,8 @@ run() {
 	fi
 
 	if ((!YES)); then
-		if ((n == 1)); then printf '  Clean this target?'; else printf '  Clean these %d targets?' "$n"; fi
+		s=$(($(total_of safe) + $( ((DEEP)) || [[ -n "$ONLY" ]] && total_of deep || echo 0)))
+		if ((n == 1)); then printf '  Clean 1 target, %s?' "$(human "$s")"; else printf '  Clean %d targets, %s?' "$n" "$(human "$s")"; fi
 		printf ' %s[y/N]%s ' "$D" "$R"
 		read -r ans </dev/tty
 		[[ "$ans" == [yY]* ]] || { say "  Nothing changed."; say ""; return 0; }
@@ -695,19 +1038,19 @@ run() {
 			((freed < 0)) && freed=0
 			sum=$((sum + freed))
 			status_clear
-			row "$id" "${LABELS[$i]}" "$(human "$freed")" "freed" "$GRN"
+			row "$id" "$(human "$freed")" "${LABELS[$i]}" "" "$GRN"
 			log "ok	$id	freed=${freed}KB"
 		else
 			failed=$((failed + 1))
 			status_clear
-			row "$id" "${LABELS[$i]}" "failed" "see the log" "$RED"
+			row "$id" "failed" "${LABELS[$i]}" "see the log" "$RED"
 			log "error	$id"
 		fi
 	done
 
 	read -r total free < <(disk)
 	say ""
-	say "  ${B}Freed $(human "$sum").${R}${D} Now $(human "$free") free of $(human "$total").${R}"
+	say "  ${B}Freed $(human "$sum").${R}${D} $(human "$free") free / $(human "$total").${R}"
 	((failed)) && say "  ${RED}$failed failed.${R} ${D}Log: ${LOG_FILE/#$HOME/~}${R}"
 	hints
 	say ""
@@ -721,7 +1064,7 @@ cmd_help() {
   ${B}mackerel${R} ${D}$VERSION${R}  free disk space on a Mac without losing work
 
   ${B}Usage${R}
-    mackerel [options]           show what can be freed, ask, clean
+    mackerel [options]           pick what to clean (↑↓ space a ⏎ q)
 
   ${B}Options${R}
     -n, --dry-run                show what can be freed and stop
@@ -760,7 +1103,7 @@ EOF
 
 # ── Arguments ───────────────────────────────────────────────────────────────
 
-DRY=0 DEEP=0 ALL=0 YES=0 BELOW="" ONLY=""
+DRY=0 DEEP=0 ALL=0 YES=0 BELOW="" ONLY="" INTER=0
 
 while (($#)); do
 	case "$1" in
@@ -788,6 +1131,7 @@ if ((!DRY && !YES)) && [[ ! -t 0 ]]; then
 	err "no terminal to ask on; add --yes"
 	exit 2
 fi
+((TTY && !DRY && !YES)) && [[ -t 0 ]] && INTER=1
 
 # One run at a time: two cleanups in parallel measure wrong and get in each other's way.
 if ! mkdir "$LOCK_DIR" 2>/dev/null; then
@@ -799,8 +1143,8 @@ if ! mkdir "$LOCK_DIR" 2>/dev/null; then
 	rm -rf "$LOCK_DIR" && mkdir "$LOCK_DIR" || { err "cannot create $LOCK_DIR"; exit 3; }
 fi
 echo $$ >"$LOCK_DIR/pid"
-trap 'status_clear; rm -rf "$LOCK_DIR"' EXIT
+trap 'tui_off; status_clear; rm -rf "$LOCK_DIR"' EXIT
 trap 'exit 130' INT TERM
 mkdir -p "$(dirname "$LOG_FILE")"
 
-run
+run; exit $? # on one line: bash reads the script as it runs, so nothing after this is read
