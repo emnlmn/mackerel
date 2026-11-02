@@ -57,6 +57,14 @@ or download again.
 
 mackerel is one Bash script. It needs nothing beyond what macOS ships.
 
+With Homebrew:
+
+```sh
+brew install emnlmn/mackerel/mackerel
+```
+
+or from source:
+
 ```sh
 git clone https://github.com/emnlmn/mackerel.git ~/Code/mackerel
 ln -s ~/Code/mackerel/mackerel ~/.local/bin/mackerel   # or any directory on your PATH
